@@ -16,7 +16,7 @@ const client = new BedrockRuntimeClient({
   },
 });
 
-const BEDROCK_MODEL_ID = "anthropic.claude-sonnet-4-6";
+const BEDROCK_MODEL_ID = "us.anthropic.claude-sonnet-4-5-20250929-v1:0";
 
 // Health check
 app.get("/", (req, res) => res.json({ status: "SurvAI API running on Bedrock" }));
