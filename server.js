@@ -1,5 +1,6 @@
 const express = require("express");
 const cors = require("cors");
+const { BedrockRuntimeClient, InvokeModelCommand } = require("@aws-sdk/client-bedrock-runtime");
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -7,31 +8,47 @@ const PORT = process.env.PORT || 3001;
 app.use(cors({ origin: "*" }));
 app.use(express.json({ limit: "10mb" }));
 
+const client = new BedrockRuntimeClient({
+  region: process.env.AWS_REGION || "us-east-1",
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+  },
+});
+
+const BEDROCK_MODEL_ID = "anthropic.claude-sonnet-4-5-20251001";
+
 // Health check
-app.get("/", (req, res) => res.json({ status: "SurvAI API running" }));
+app.get("/", (req, res) => res.json({ status: "SurvAI API running on Bedrock" }));
 
-// Main Claude proxy - no timeout limits
+// Main Claude proxy - AWS Bedrock (HIPAA-eligible, no API key needed)
 app.post("/api/claude", async (req, res) => {
-  const apiKey = req.headers["x-api-key"] || req.body?.apiKey;
-  if (!apiKey) return res.status(401).json({ error: { message: "API key required" } });
-
   const body = { ...req.body };
   delete body.apiKey;
 
+  const { model, ...rest } = body;
+
+  const bedrockBody = {
+    anthropic_version: "bedrock-2023-05-31",
+    max_tokens: rest.max_tokens || 4096,
+    messages: rest.messages || [],
+    ...(rest.system ? { system: rest.system } : {}),
+    ...(rest.temperature !== undefined ? { temperature: rest.temperature } : {}),
+  };
+
   try {
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "anthropic-version": "2023-06-01",
-        "x-api-key": apiKey,
-      },
-      body: JSON.stringify(body),
+    const command = new InvokeModelCommand({
+      modelId: BEDROCK_MODEL_ID,
+      contentType: "application/json",
+      accept: "application/json",
+      body: JSON.stringify(bedrockBody),
     });
 
-    const data = await response.json();
-    return res.status(response.status).json(data);
+    const response = await client.send(command);
+    const data = JSON.parse(new TextDecoder().decode(response.body));
+    return res.status(200).json(data);
   } catch (err) {
+    console.error("Bedrock error:", err.message);
     return res.status(500).json({ error: { message: err.message } });
   }
 });
