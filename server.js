@@ -236,7 +236,7 @@ app.post("/api/claude", async (req, res) => {
 
   const bedrockBody = {
     anthropic_version: "bedrock-2023-05-31",
-    max_tokens: rest.max_tokens || 4096,
+    max_tokens: rest.max_tokens || 6000,
     messages: rest.messages || [],
     ...(rest.system ? { system: rest.system } : {}),
     ...(rest.temperature !== undefined ? { temperature: rest.temperature } : {}),
