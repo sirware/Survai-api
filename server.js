@@ -209,7 +209,7 @@ function deadlineReminderHtml(facilityName, tags, surveyDate, complianceDate, da
             </td></tr>
           </table>
 
-          <p style="color:#94a3b8;font-size:12px;line-height:1.6;margin:0;text-align:center;">This is an automated reminder from SurvAIHealth. You are receiving this because you are listed as a responsible party for this facility's compliance.</p>
+          <p style="color:#94a3b8;font-size:12px;line-height:1.6;margin:0;text-align:center;">CMS requires Plan of Correction submission within 10 calendar days of survey receipt. This is an automated reminder from SurvAIHealth.</p>
         </td></tr>
 
         <!-- Footer -->
