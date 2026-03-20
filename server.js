@@ -56,7 +56,7 @@ async function sendEmail(to, subject, htmlBody, textBody) {
 }
 
 // ─── Email Templates ──────────────────────────────────────────────────────────
-function welcomeEmailHtml(name, email, tempPassword, role, facilityName) {
+function welcomeEmailHtml(name, email, tempPassword, role, facilityName, isReactivation = false) {
   return `
 <!DOCTYPE html>
 <html>
@@ -78,13 +78,13 @@ function welcomeEmailHtml(name, email, tempPassword, role, facilityName) {
 
         <!-- Body -->
         <tr><td style="padding:40px;">
-          <h2 style="color:#0f172a;font-size:22px;margin:0 0 8px;">Welcome to SurvAIHealth, ${name}! 👋</h2>
-          <p style="color:#475569;font-size:15px;line-height:1.6;margin:0 0 24px;">Your account has been created. You can now log in and start managing Plans of Correction for your facility.</p>
+          <h2 style="color:#0f172a;font-size:22px;margin:0 0 8px;">${isReactivation ? "Your Account Has Been Reactivated 🔓" : "Welcome to SurvAIHealth, " + name + "! 👋"}</h2>
+          <p style="color:#475569;font-size:15px;line-height:1.6;margin:0 0 24px;">${isReactivation ? "Your SurvAIHealth account has been reactivated. Use the credentials below to sign back in." : "Your account has been created. You can now log in and start managing Plans of Correction for your facility."}</p>
 
           <!-- Credentials Box -->
           <table width="100%" cellpadding="0" cellspacing="0" style="background:#f0f9ff;border:1px solid #bae6fd;border-radius:10px;margin-bottom:28px;">
             <tr><td style="padding:24px;">
-              <div style="font-size:13px;font-weight:700;color:#0369a1;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:16px;">Your Login Credentials</div>
+              <div style="font-size:13px;font-weight:700;color:#0369a1;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:16px;">${isReactivation ? "Your New Login Credentials" : "Your Login Credentials"}</div>
               <table width="100%" cellpadding="0" cellspacing="0">
                 <tr>
                   <td style="padding:8px 0;color:#64748b;font-size:14px;width:130px;">Email:</td>
@@ -276,9 +276,14 @@ app.post("/api/email/welcome", async (req, res) => {
     viewer: "Viewer",
   };
 
-  const subject = `Welcome to SurvAIHealth — Your Account is Ready`;
-  const html = welcomeEmailHtml(name, email, tempPassword, roleLabels[role] || role, facilityName);
-  const text = `Welcome to SurvAIHealth, ${name}!\n\nYour account has been created.\n\nEmail: ${email}\nTemporary Password: ${tempPassword}\nRole: ${roleLabels[role] || role}${facilityName ? `\nFacility: ${facilityName}` : ""}\n\nSign in at: https://survaihealth.com\n\nPlease change your password after your first login.\n\nSurvAIHealth LLC`;
+  const isReactivation = req.body.isReactivation === true;
+  const subject = isReactivation
+    ? `Your SurvAIHealth Account Has Been Reactivated`
+    : `Welcome to SurvAIHealth — Your Account is Ready`;
+  const html = welcomeEmailHtml(name, email, tempPassword, roleLabels[role] || role, facilityName, isReactivation);
+  const text = isReactivation
+    ? `Your SurvAIHealth account has been reactivated, ${name}.\n\nEmail: ${email}\nNew Temporary Password: ${tempPassword}\n\nSign in at: https://survaihealth.com\n\nPlease change your password after logging in.\n\nSurvAIHealth LLC`
+    : `Welcome to SurvAIHealth, ${name}!\n\nYour account has been created.\n\nEmail: ${email}\nTemporary Password: ${tempPassword}\nRole: ${roleLabels[role] || role}${facilityName ? `\nFacility: ${facilityName}` : ""}\n\nSign in at: https://survaihealth.com\n\nPlease change your password after your first login.\n\nSurvAIHealth LLC`;
 
   const result = await sendEmail(email, subject, html, text);
 
