@@ -327,4 +327,113 @@ app.post("/api/email/deadline", async (req, res) => {
   });
 });
 
+// ─── Demo Request Email ──────────────────────────────────────────────────────
+app.post("/api/email/demo", async (req, res) => {
+  const { name, email, facility, role, facilities, message } = req.body;
+
+  if (!name || !email) {
+    return res.status(400).json({ error: "Name and email are required" });
+  }
+
+  const subject = `New Demo Request — ${facility || "Unknown Facility"} (${role || "Unknown Role"})`;
+
+  const html = `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="margin:0;padding:0;background:#f1f5f9;font-family:Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f1f5f9;padding:40px 20px;">
+    <tr><td align="center">
+      <table width="600" cellpadding="0" cellspacing="0" style="background:white;border-radius:12px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.08);">
+        <tr><td style="background:linear-gradient(135deg,#0b3660,#0f4c81);padding:28px 40px;">
+          <div style="font-size:22px;font-weight:800;color:white;">SurvAI<span style="color:#38bdf8;">Health</span></div>
+          <div style="color:#93c5fd;font-size:12px;margin-top:4px;">New Demo Request</div>
+        </td></tr>
+        <tr><td style="padding:32px 40px;">
+          <h2 style="color:#0f172a;font-size:20px;margin:0 0 24px;">🎯 New Demo Request</h2>
+          <table width="100%" cellpadding="0" cellspacing="0" style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;">
+            <tr><td style="padding:20px 24px;">
+              <table width="100%">
+                <tr>
+                  <td style="padding:8px 0;color:#64748b;font-size:14px;width:140px;font-weight:600;">Name:</td>
+                  <td style="padding:8px 0;color:#0f172a;font-size:14px;font-weight:700;">${name}</td>
+                </tr>
+                <tr>
+                  <td style="padding:8px 0;color:#64748b;font-size:14px;font-weight:600;">Email:</td>
+                  <td style="padding:8px 0;color:#0891b2;font-size:14px;">${email}</td>
+                </tr>
+                <tr>
+                  <td style="padding:8px 0;color:#64748b;font-size:14px;font-weight:600;">Facility:</td>
+                  <td style="padding:8px 0;color:#0f172a;font-size:14px;">${facility || "Not provided"}</td>
+                </tr>
+                <tr>
+                  <td style="padding:8px 0;color:#64748b;font-size:14px;font-weight:600;">Role:</td>
+                  <td style="padding:8px 0;color:#0f172a;font-size:14px;">${role || "Not provided"}</td>
+                </tr>
+                <tr>
+                  <td style="padding:8px 0;color:#64748b;font-size:14px;font-weight:600;">Facilities:</td>
+                  <td style="padding:8px 0;color:#0f172a;font-size:14px;">${facilities || "1 facility"}</td>
+                </tr>
+                ${message ? `<tr>
+                  <td style="padding:8px 0;color:#64748b;font-size:14px;font-weight:600;vertical-align:top;">Message:</td>
+                  <td style="padding:8px 0;color:#0f172a;font-size:14px;line-height:1.6;">${message}</td>
+                </tr>` : ""}
+              </table>
+            </td></tr>
+          </table>
+          <div style="margin-top:24px;padding:16px 20px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;">
+            <div style="font-size:13px;color:#166534;font-weight:600;">📧 Reply directly to this email to respond to ${name}</div>
+          </div>
+        </td></tr>
+        <tr><td style="background:#f8fafc;border-top:1px solid #e2e8f0;padding:16px 40px;text-align:center;">
+          <p style="color:#94a3b8;font-size:12px;margin:0;">SurvAIHealth LLC · survaihealth.com</p>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`;
+
+  const text = `New Demo Request
+
+Name: ${name}
+Email: ${email}
+Facility: ${facility || "Not provided"}
+Role: ${role || "Not provided"}
+Facilities: ${facilities || "1"}
+Message: ${message || "None"}
+
+Reply to: ${email}`;
+
+  // Send to notifications email AND set reply-to as the requester
+  const apiKey = process.env.SENDGRID_API_KEY;
+  const fromEmail = process.env.FROM_EMAIL || "notifications@survaihealth.com";
+
+  if (!apiKey) return res.status(500).json({ error: "Email not configured" });
+
+  const response = await fetch("https://api.sendgrid.com/v3/mail/send", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify({
+      personalizations: [{ to: [{ email: fromEmail }] }],
+      from: { email: fromEmail, name: "SurvAIHealth" },
+      reply_to: { email: email, name: name },
+      subject,
+      content: [
+        { type: "text/plain", value: text },
+        { type: "text/html", value: html },
+      ],
+    }),
+  });
+
+  if (!response.ok) {
+    const err = await response.text();
+    console.error("SendGrid demo error:", err);
+    return res.status(500).json({ error: "Failed to send email" });
+  }
+
+  console.log(`Demo request from ${name} at ${facility}`);
+  return res.status(200).json({ success: true });
+});
+
 app.listen(PORT, () => console.log(`SurvAI API running on port ${PORT}`));
