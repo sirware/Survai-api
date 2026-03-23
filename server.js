@@ -311,4 +311,98 @@ app.post("/api/email/demo", async (req, res) => {
   return res.status(200).json({ success: true });
 });
 
+
+// ─── Supabase Auth Admin Routes ───────────────────────────────────────────────
+// These use the Supabase service role key to manage Auth users server-side
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SECRET_KEY;
+
+async function supabaseAdminFetch(path, method, body) {
+  const response = await fetch(`${SUPABASE_URL}/auth/v1/admin${path}`, {
+    method,
+    headers: {
+      "Content-Type": "application/json",
+      "apikey": SUPABASE_SERVICE_KEY,
+      "Authorization": `Bearer ${SUPABASE_SERVICE_KEY}`,
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  return response.json();
+}
+
+// Create a new Supabase Auth user (called when adding a user in the app)
+app.post("/api/auth/create-user", async (req, res) => {
+  const { email, password, name } = req.body;
+  if (!email || !password) return res.status(400).json({ error: "email and password required" });
+  try {
+    const data = await supabaseAdminFetch("/users", "POST", {
+      email,
+      password,
+      email_confirm: true,
+      user_metadata: { name },
+    });
+    if (data.error) {
+      // User may already exist — try to update password instead
+      console.warn("Create user error:", data.error);
+      return res.status(200).json({ success: false, reason: data.error.message });
+    }
+    console.log(`Supabase Auth user created: ${email}`);
+    return res.status(200).json({ success: true, id: data.id });
+  } catch (err) {
+    console.error("/api/auth/create-user error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Reset a user's password in Supabase Auth (called from admin password reset)
+app.post("/api/auth/reset-password", async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: "email and password required" });
+  try {
+    // Find the user by email first
+    const listData = await supabaseAdminFetch(`/users?email=${encodeURIComponent(email)}`, "GET");
+    const user = listData.users?.[0];
+    if (!user) {
+      // User doesn't exist in Supabase Auth yet — create them
+      const createData = await supabaseAdminFetch("/users", "POST", {
+        email,
+        password,
+        email_confirm: true,
+      });
+      if (createData.error) return res.status(400).json({ error: createData.error.message });
+      return res.status(200).json({ success: true, created: true });
+    }
+    // Update existing user's password
+    const updateData = await supabaseAdminFetch(`/users/${user.id}`, "PUT", { password });
+    if (updateData.error) return res.status(400).json({ error: updateData.error.message });
+    console.log(`Supabase Auth password reset: ${email}`);
+    return res.status(200).json({ success: true });
+  } catch (err) {
+    console.error("/api/auth/reset-password error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Migrate existing users to Supabase Auth (one-time call)
+app.post("/api/auth/migrate-users", async (req, res) => {
+  const { users } = req.body;
+  if (!users?.length) return res.status(400).json({ error: "users array required" });
+  const results = [];
+  for (const u of users) {
+    try {
+      const data = await supabaseAdminFetch("/users", "POST", {
+        email: u.email,
+        password: u.tempPassword,
+        email_confirm: true,
+        user_metadata: { name: u.name },
+      });
+      results.push({ email: u.email, success: !data.error, error: data.error?.message });
+    } catch(e) {
+      results.push({ email: u.email, success: false, error: e.message });
+    }
+  }
+  console.log(`Migration: ${results.filter(r => r.success).length}/${results.length} users created`);
+  return res.status(200).json({ results });
+});
+
 app.listen(PORT, () => console.log(`SurvAI API running on port ${PORT}`));
