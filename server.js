@@ -373,7 +373,7 @@ app.post("/api/auth/reset-password", async (req, res) => {
       return res.status(200).json({ success: true, created: true });
     }
     // Update existing user's password
-    const updateData = await supabaseAdminFetch(`/users/${user.id}`, "PUT", { password });
+    const updateData = await supabaseAdminFetch(`/users/${user.id}`, "PATCH", { password });
     if (updateData.error) return res.status(400).json({ error: updateData.error.message });
     console.log(`Supabase Auth password reset: ${email}`);
     return res.status(200).json({ success: true });
