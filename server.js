@@ -94,9 +94,22 @@ async function runBatchJob(batchId, citations, facility, settings, userId, facil
     let pipData = null;
     let lastError = null;
 
+    // POC Gatekeeper — block generation for hard fails or very noisy citations
+    const gate = canGeneratePOC(citation);
+    if (!gate.allowed) {
+      console.warn("[Batch " + batchId + "] Skipping " + (citation.tags?.[0] || "?") + " — " + gate.reason);
+      job.failed++;
+      job.errors.push((citation.tags?.[0] || "?") + ": blocked — " + gate.reason);
+      job.current = job.done + job.failed;
+      return;
+    }
+    if (gate.flagged) {
+      console.log("[Batch " + batchId + "] " + (citation.tags?.[0] || "?") + " flagged (needs review) but proceeding");
+    }
+
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        const guidance = ""; // guidance lookup happens client-side; server uses deficiency text
+        const guidance = "";
         pipData = await generatePOCOnServer(citation, facility, guidance, settings.includeDates !== false);
         break;
       } catch (err) {
@@ -475,6 +488,164 @@ app.post("/api/email/demo", async (req, res) => {
   return res.status(200).json({ success: true });
 });
 
+// ─── CMS-2567 Citation Validator & Normalizer ────────────────────────────────
+
+const BOILERPLATE_PATTERNS_VALIDATE = [
+  /DEPARTMENT OF HEALTH AND HUMAN SERVICES/i,
+  /CENTERS FOR MEDICARE (AND|&) MEDICAID SERVICES/i,
+  /STATEMENT OF DEFICIENCIES AND PLAN OF CORRECTIONS?/i,
+  /FORM APPROVED/i,
+  /OMB\s*NO\./i,
+  /PROVIDER\/SUPPLIER\/CLIA IDENTIFICATION NUMBER/i,
+  /NAME OF PROVIDER OR SUPPLIER/i,
+  /STREET ADDRESS,\s*CITY,\s*STATE,\s*ZIP/i,
+  /SUMMARY STATEMENT OF DEFICIENCIES/i,
+  /PROVIDER.?S PLAN OF CORRECTION/i,
+  /FORM\s+CMS[-\s]?2567/i,
+  /Previous Versions? Obsolete/i,
+  /If continuation sheet Page/i,
+  /Continued from page/i,
+  /Event ID:/i,
+  /Facility ID:/i,
+];
+
+function containsBoilerplate(text) {
+  if (!text) return false;
+  return BOILERPLATE_PATTERNS_VALIDATE.some(p => p.test(text));
+}
+
+function stripBoilerplateFromField(text) {
+  if (!text) return text;
+  let cleaned = text;
+  for (const p of BOILERPLATE_PATTERNS_VALIDATE) {
+    cleaned = cleaned.replace(new RegExp(p.source, "gi"), " ");
+  }
+  return cleaned.replace(/\s{3,}/g, " ").trim();
+}
+
+function validateAndScoreCitation(citation) {
+  const hardErrors = [];
+  const softErrors = [];
+  const tag = (citation.tag_number || "").trim();
+
+  // Hard fail rules
+  if (tag === "F0000") hardErrors.push("F0000 must not appear as a deficiency citation");
+  if (!/^[FKE]\d{3,4}$/.test(tag)) hardErrors.push("Invalid tag_number: " + tag);
+  const ps = citation.page_start, pe = citation.page_end;
+  if (ps !== null && pe !== null && typeof ps === "number" && typeof pe === "number" && ps > pe) hardErrors.push("page_start > page_end");
+  if (!citation.regulatory_title?.trim()) hardErrors.push(tag + ": missing regulatory_title");
+  if (!citation.deficiency_narrative_full?.trim()) hardErrors.push(tag + ": missing deficiency_narrative_full");
+
+  // Auto-strip boilerplate from narrative fields and flag if found
+  const narrativeFields = ["deficiency_narrative_full","deficiency_summary","findings_full","observation_evidence","interview_evidence","record_review_evidence"];
+  for (const field of narrativeFields) {
+    if (containsBoilerplate(citation[field] || "")) {
+      hardErrors.push(tag + ": boilerplate leaked into " + field + " — auto-stripped");
+      citation[field] = stripBoilerplateFromField(citation[field]);
+    }
+  }
+
+  // Soft fail / human review rules
+  if (!citation.scope_severity?.trim()) softErrors.push(tag + ": missing scope_severity");
+  if (ps === null || pe === null) softErrors.push(tag + ": missing page range");
+  if ((citation.deficiency_summary || "").trim().length < 20) softErrors.push(tag + ": deficiency_summary suspiciously short");
+  if (/Continued from page/i.test(citation.deficiency_narrative_full || "")) softErrors.push(tag + ": continuation marker leaked into narrative");
+  const hasQuote = /"/.test(citation.deficiency_narrative_full || "") || /\u201c/.test(citation.deficiency_narrative_full || "");
+  if (hasQuote && !(citation.direct_quotes?.length)) softErrors.push(tag + ": quotes in narrative but direct_quotes empty");
+  const evidenceAllBlank = !citation.observation_evidence && !citation.interview_evidence && !citation.record_review_evidence;
+  if (evidenceAllBlank && (citation.affected_residents?.length || 0) > 0) softErrors.push(tag + ": residents cited but all evidence fields empty");
+  const statePattern = /WAC\s+\d|RCW\s+\d|CMR\s+\d|\d{1,3}\s+ILCS/i;
+  if (statePattern.test(citation.deficiency_narrative_full || "") && !(citation.state_regulatory_references?.length)) softErrors.push(tag + ": state reference in text but state_regulatory_references empty");
+
+  // Confidence scoring
+  let noiseScore = 0;
+  if (!citation.scope_severity) noiseScore += 0.2;
+  if (!citation.cfr_citations?.length) noiseScore += 0.15;
+  if (!citation.regulatory_title) noiseScore += 0.2;
+  if (!citation.deficiency_summary) noiseScore += 0.15;
+  if (hardErrors.length > 0) noiseScore = Math.min(1, noiseScore + 0.3);
+  noiseScore = Math.round(Math.min(1, noiseScore) * 100) / 100;
+
+  let boundaryConfidence = 1.0;
+  if (/Continued from page/i.test(citation.deficiency_narrative_full || "")) boundaryConfidence -= 0.4;
+  if (!citation.regulatory_title) boundaryConfidence -= 0.3;
+  boundaryConfidence = Math.round(Math.max(0, boundaryConfidence) * 100) / 100;
+
+  const parseConfidence = Math.round(Math.max(0, 1 - noiseScore - (softErrors.length * 0.05)) * 100) / 100;
+
+  // Status
+  let status = "approved_for_poc";
+  if (hardErrors.length > 0) status = "hard_fail";
+  else if (softErrors.length > 0) { status = "needs_human_review"; citation.requires_human_review = true; }
+
+  // Augment with operational fields
+  citation.parse_confidence = parseConfidence;
+  citation.boundary_confidence = boundaryConfidence;
+  citation.noise_score = noiseScore;
+  citation.resident_count_detected = citation.affected_residents?.length || 0;
+  citation.citation_has_state_reference = (citation.state_regulatory_references?.length || 0) > 0;
+  citation.citation_has_direct_quote = (citation.direct_quotes?.length || 0) > 0;
+  citation.validation_status = status;
+  citation.hard_errors = hardErrors;
+  citation.soft_errors = softErrors;
+
+  return { hardErrors, softErrors, status };
+}
+
+function normalizeCitation(citation, surveyUid) {
+  // Normalize tag to F#### (3-digit → pad to 4)
+  if (citation.tag_number && /^[FKE]\d{3}$/.test(citation.tag_number)) {
+    citation.tag_number = citation.tag_number[0] + citation.tag_number.slice(1).padStart(4, "0");
+  }
+  // Ensure required arrays
+  for (const f of ["cfr_citations","affected_residents","staff_statements","administrator_statements","facility_expectation_statements","policy_or_guideline_references","state_regulatory_references","direct_quotes","hard_errors","soft_errors"]) {
+    if (!Array.isArray(citation[f])) citation[f] = [];
+  }
+  // Ensure required strings
+  for (const f of ["scope_severity","scope_severity_raw","regulatory_title","federal_requirement_text","deficiency_narrative_full","deficiency_summary","sample_scope_text","harm_or_risk_statement","findings_full","observation_evidence","interview_evidence","record_review_evidence","deficiency_category","department_owner"]) {
+    if (typeof citation[f] !== "string") citation[f] = "";
+  }
+  // Ensure poc_inputs
+  if (!citation.poc_inputs || typeof citation.poc_inputs !== "object") citation.poc_inputs = {};
+  for (const f of ["immediate_correction_candidates","systemic_issue_candidates","monitoring_candidates","training_candidates","documentation_gaps","evidence_needed_for_rebuttal_or_context"]) {
+    if (!Array.isArray(citation.poc_inputs[f])) citation.poc_inputs[f] = [];
+  }
+  for (const f of ["core_problem_statement","who_was_affected","what_failed","why_this_matters"]) {
+    if (typeof citation.poc_inputs[f] !== "string") citation.poc_inputs[f] = "";
+  }
+  citation.survey_uid = surveyUid || "";
+  citation.citation_uid = (citation.tag_number || "") + "-" + Date.now() + "-" + Math.random().toString(36).slice(2, 6);
+  citation.requires_human_review = citation.requires_human_review || false;
+  citation.page_start = citation.page_start || null;
+  citation.page_end = citation.page_end || null;
+  return citation;
+}
+
+// ─── POC Gatekeeper ──────────────────────────────────────────────────────────
+// A citation must pass all of these before server-side POC generation runs.
+// Prevents bad downstream outputs from noisy or incomplete extractions.
+
+function canGeneratePOC(citation) {
+  if (!citation) return { allowed: false, reason: "No citation object" };
+  if (citation.validation_status === "hard_fail") {
+    return { allowed: false, reason: "Hard validation failure: " + (citation.hard_errors || []).join("; ") };
+  }
+  if ((citation.noise_score || 0) > 0.35) {
+    return { allowed: false, reason: "Noise score too high: " + citation.noise_score };
+  }
+  if ((citation.boundary_confidence || 1) < 0.5) {
+    return { allowed: false, reason: "Boundary confidence too low: " + citation.boundary_confidence };
+  }
+  if (!citation.deficiency_narrative_full?.trim() && !citation.deficiency_statement?.trim()) {
+    return { allowed: false, reason: "No deficiency narrative — cannot generate meaningful POC" };
+  }
+  // Needs human review is allowed but flagged
+  if (citation.requires_human_review || citation.validation_status === "needs_human_review") {
+    return { allowed: true, flagged: true, reason: "Needs human review: " + (citation.soft_errors || []).join("; ") };
+  }
+  return { allowed: true, flagged: false, reason: null };
+}
+
 // ─── PDF Parse — server-side extraction, column-aware ────────────────────────
 app.post("/api/parse-pdf", async (req, res) => {
   const { pdfBase64, facilityName } = req.body;
@@ -604,24 +775,134 @@ async function runParseJob(jobId, pdfBase64, facilityName) {
     job.status = "parsing";
     console.log("[Parse " + jobId + "] Extracted " + parsed.numpages + " pages, " + docText.length + " chars");
 
-    // ── Step 2: Regex-first — locate every F/K/E tag deterministically ─────────
-    // Tags are the primary delimiter. Regex never misses or invents a tag.
-    // Skip F0000 (initial comments metadata — not a deficiency citation)
+    // ══════════════════════════════════════════════════════════════════════════
+    // STAGE 1 — DOCUMENT CLEANUP
+    // Strip all CMS-2567 page furniture, headers, footers, boilerplate, and
+    // continuation markers BEFORE any segmentation or extraction.
+    // This prevents repeated form text from inflating citation blocks.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    // LINE-BY-LINE pre-clean pass — exact match patterns from CMS-2567 spec
+    const LINE_EXCLUSION_PATTERNS = [
+      /^PRINTED:/i,
+      /^DEPARTMENT OF HEALTH AND HUMAN SERVICES/i,
+      /^CENTERS FOR MEDICARE (AND|&) MEDICAID SERVICES/i,
+      /^FORM APPROVED/i,
+      /^OMB\s*N[O0]\.?/i,
+      /^STATEMENT OF DEFICIENCIES/i,
+      /^FORM\s+CMS[-\s]?2567/i,
+      /^Event ID:/i,
+      /^Facility ID:/i,
+      /^If continuation sheet/i,
+      /^Continued from page/i,
+      /^PROVIDER\/SUPPLIER\/CLIA/i,
+      /^DATE SURVEY COMPLETED/i,
+      /^NAME OF PROVIDER OR SUPPLIER/i,
+      /^STREET ADDRESS[,\s]/i,
+      /^ID\s+PREFIX\s+TAG/i,
+      /^SUMMARY STATEMENT OF DEFICIENCIES/i,
+      /^PROVIDER.?S PLAN OF CORRECTION/i,
+      /^\(X[1-5]\)/i,
+      /^COMPLETION DATE/i,
+      /^CONTINUATION SHEET/i,
+      /^Previous Versions? Obsolete/i,
+      /^STATE REPRESENTATIVE SIGNATURE/i,
+      /^SURVEYOR SIGNATURE/i,
+      /^TITLE\s+DATE\s+TIME/i,
+      /^Page\s+\d+\s+of\s+\d+$/i,
+      /^\d+$/, // standalone page numbers
+    ];
+
+    // INLINE patterns — remove anywhere in a line, not just at start
+    const INLINE_EXCLUSION_PATTERNS = [
+      /DEPARTMENT OF HEALTH AND HUMAN SERVICES/gi,
+      /CENTERS FOR MEDICARE (AND|&) MEDICAID SERVICES/gi,
+      /STATEMENT OF DEFICIENCIES AND PLAN OF CORRECTIONS?/gi,
+      /FORM\s+CMS[-\s]?2567[^\n]*/gi,
+      /Previous Versions? Obsolete[^\n]*/gi,
+      /Event ID:\s*[A-Z0-9-]*/gi,
+      /Facility ID:\s*[A-Z0-9-]*/gi,
+      /If continuation sheet\.?\s*Page\s+\d+\s+of\s+\d+/gi,
+      /Continued from page\s+\d+/gi,
+      /OMB\s*N[O0]\.?\s*0938-0391/gi,
+      /FORM APPROVED/gi,
+      /\(X[1-5]\)\s*[A-Z\/\s]+[:]/gi,
+    ];
+
+    // F0000 block — remove everything from F0000 up to the first real citation tag
+    const f0000Match = docText.match(/\bF0*000\b[\s\S]*?(?=\bF0*[1-9]\d{2,3}\b)/);
+    let workDoc = f0000Match ? docText.slice(f0000Match.index + f0000Match[0].length) : docText;
+
+    // Apply inline patterns first
+    for (const p of INLINE_EXCLUSION_PATTERNS) {
+      workDoc = workDoc.replace(p, " ");
+    }
+
+    // Apply line-level patterns
+    let cleanedText = workDoc
+      .split("\n")
+      .filter(line => {
+        const t = line.trim();
+        if (!t) return false;
+        // Test each line-exclusion pattern
+        for (const p of LINE_EXCLUSION_PATTERNS) {
+          if (p.test(t)) return false;
+        }
+        // Discard short all-caps lines that are clearly column labels or metadata
+        // (exclude lines that contain an actual F/K/E tag — those are citation headers)
+        if (
+          t === t.toUpperCase() &&
+          t.length < 80 &&
+          t.split(/\s+/).length <= 8 &&
+          !/\b[FKE]\d{3,4}\b/.test(t) &&
+          !/SS\s*=/.test(t) &&
+          !/CFR|483\./.test(t)
+        ) return false;
+        return true;
+      })
+      .join("\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+
+    const removedChars = docText.length - cleanedText.length;
+    console.log("[Parse " + jobId + "] Stage 1 cleanup: " + cleanedText.length + " chars (" + removedChars + " removed)");
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // STAGE 2 — CITATION SEGMENTATION
+    // Find the FIRST occurrence of each unique F/K/E tag in the cleaned text.
+    // A citation starts only when a new tag appears followed by regulatory
+    // context (SS=, CFR, or regulatory title text).
+    // ══════════════════════════════════════════════════════════════════════════
+
     const tagPattern = /\b([FKE])(\d{3,4})\b/g;
     const tagMatches = [];
     let m;
-    while ((m = tagPattern.exec(docText)) !== null) {
+    while ((m = tagPattern.exec(cleanedText)) !== null) {
       const tag = m[1] + m[2];
-      if (tag === "F0000" || tag === "F000") continue; // skip initial comments block
-      tagMatches.push({ tag, pos: m.index });
+      if (tag === "F0000" || tag === "F000") continue;
+      // A citation start: tag must be followed by SS=, regulatory title, or CFR text
+      // within 300 chars — filters out cross-references inside narrative text
+      const after = cleanedText.slice(m.index, m.index + 300);
+      const isCitationStart =
+        /SS\s*=\s*[A-L]/i.test(after) ||
+        /42\s*CFR/i.test(after) ||
+        /483\.\d/i.test(after) ||
+        /This REQUIREMENT/i.test(after) ||
+        tagMatches.length === 0;
+      if (isCitationStart) tagMatches.push({ tag, pos: m.index });
     }
 
-    // Deduplicate: same tag within 100 chars = same occurrence (tag printed in header + body)
-    const uniqueTagPositions = tagMatches.filter((t, i) => {
-      if (i === 0) return true;
-      const prev = tagMatches[i - 1];
-      return !(t.tag === prev.tag && t.pos - prev.pos < 100);
-    });
+    // Keep only FIRST occurrence of each tag — continuation pages repeat the tag
+    const seenTags = new Set();
+    const uniqueTagPositions = [];
+    for (const t of tagMatches) {
+      if (seenTags.has(t.tag)) continue;
+      seenTags.add(t.tag);
+      uniqueTagPositions.push(t);
+    }
+
+    // Replace docText references below with cleanedText
+    const workingText = cleanedText;
 
     console.log("[Parse " + jobId + "] Regex found " + uniqueTagPositions.length + " tags: " + uniqueTagPositions.map(t => t.tag).join(", "));
     job.totalChunks = uniqueTagPositions.length;
@@ -636,20 +917,25 @@ async function runParseJob(jobId, pdfBase64, facilityName) {
     // ── Step 3: Slice document into per-citation blocks ───────────────────────
     // Each block = everything from this tag's position to the next tag's position
     // "Continued from page X" text stays inside the same block — not a new citation
+    // ══════════════════════════════════════════════════════════════════════════
+    // STAGE 3 — STRUCTURED EXTRACTION (per citation block)
+    // Slice cleaned text by citation boundaries, then send to AI for
+    // structured field extraction.
+    // ══════════════════════════════════════════════════════════════════════════
+
     const tagBlocks = uniqueTagPositions.map((t, i) => {
       const end = i + 1 < uniqueTagPositions.length
         ? uniqueTagPositions[i + 1].pos
-        : docText.length;
-      const blockText = docText.slice(t.pos, end)
-        .replace(/Continued from page \d+/gi, "") // strip continuation headers
-        .trim();
+        : workingText.length;
+      // Slice from cleaned text — already stripped of boilerplate
+      const blockText = workingText.slice(t.pos, end).trim();
       return { tag: t.tag, text: blockText };
     });
 
     // ── Step 4: Extract header info ───────────────────────────────────────────
     let facilityName2 = facilityName, surveyDate2 = null, surveyType2 = null;
     try {
-      const headerText = docText.slice(0, 3000);
+      const headerText = workingText.slice(0, 3000);
       const hCmd = new InvokeModelCommand({
         modelId: BEDROCK_MODEL_ID,
         contentType: "application/json",
@@ -680,52 +966,84 @@ async function runParseJob(jobId, pdfBase64, facilityName) {
     const BATCH_SIZE = 4;
     const allCitations = [];
 
-    const systemPrompt = `You are a regulatory document extraction engine specialized in CMS-2567 nursing facility survey documents.
+    const systemPrompt = `You are a CMS-2567 extraction engine built for high-precision regulatory parsing.
 
-Your job is to extract every deficiency citation from a CMS-2567 Statement of Deficiencies and convert it into clean, structured JSON for downstream compliance workflows including plan-of-correction generation, citation clustering, root-cause analysis, and reporting.
+Your sole task is to extract true deficiency citation content from a CMS-2567 Statement of Deficiencies while aggressively excluding page furniture, repeated form text, and non-substantive boilerplate.
 
-IMPORTANT PRINCIPLES:
-1. Treat the CMS-2567 as a structured regulatory artifact, not plain narrative text.
-2. A new citation block begins when a new ID Prefix Tag (F####) appears.
-3. A citation may span multiple pages. "Continued from page X" does NOT begin a new citation.
-4. Stop a citation only when the next new deficiency tag begins.
-5. Ignore F0000 Initial Comments — survey metadata, not a deficiency.
-6. Ignore page headers, footers, form labels, continuation boilerplate, and blank plan-of-correction columns.
-7. Preserve factual accuracy. Do not infer facts not clearly stated in the document.
+The text you receive has already been pre-cleaned. However, some boilerplate may still remain due to PDF extraction artifacts. Apply all exclusion rules strictly.
 
-FOR EACH CITATION EXTRACT:
-- tag_number: the F-tag normalized to F#### format
-- scope_severity: the single letter after "SS =" (e.g. D, E, G)
-- scope_severity_raw: exact text such as "SS = D"
-- regulatory_title: short title immediately following the tag
-- cfr_citations: array of all CFR references (e.g. ["483.10(c)(6)", "483.10(g)(12)"])
-- federal_requirement_text: regulatory requirement language BEFORE "This REQUIREMENT is NOT MET"
-- deficiency_summary: the opening surveyor summary of the failed practice (1-3 sentences)
-- deficiency_narrative_full: all text from "This REQUIREMENT is NOT MET as evidenced by:" to end of citation
-- sample_scope_text: phrases like "for 2 of 3 sampled residents"
-- harm_or_risk_statement: surveyor's explicit risk or harm language
-- observation_evidence: what surveyors directly observed
-- interview_evidence: what staff or residents said during interviews
-- record_review_evidence: findings from chart/record review
-- affected_residents: array of objects, one per resident with fields: resident_id, citation_specific_issue, dates_mentioned, diagnoses_or_conditions, related_staff
-- staff_statements: array of concise extracted staff statements
-- state_regulatory_references: array of state regulation references (e.g. WAC citations)
-- direct_quotes: array of verbatim quotes from residents or staff
-- poc_inputs: object with fields: core_problem_statement, what_failed, who_was_affected, why_this_matters, immediate_correction_candidates (array), systemic_issue_candidates (array), monitoring_candidates (array), training_candidates (array), documentation_gaps (array)
+STEP 1 — CLASSIFY EVERY LINE OR BLOCK before extracting:
+1. HEADER — agency names, form titles, OMB lines → DISCARD
+2. FACILITY_METADATA — provider numbers, facility name/address blocks → DISCARD
+3. COLUMN_LABEL — ID PREFIX TAG, SUMMARY STATEMENT, PROVIDER'S PLAN, COMPLETION DATE → DISCARD
+4. CONTINUATION_MARKER — "Continued from page X" → DISCARD
+5. FOOTER — FORM CMS-2567, Event ID, Facility ID, Page X of Y → DISCARD
+6. SURVEY_METADATA — F0000 INITIAL COMMENTS → DISCARD
+7. CITATION_HEADER — F-tag + SS= + regulatory title → KEEP
+8. REGULATION_TEXT — CFR citations + federal requirement language → KEEP
+9. DEFICIENCY_NARRATIVE — findings, residents, observations, interviews → KEEP
+10. PLAN_OF_CORRECTION_TEXT — only if provider actually entered text → KEEP
+11. SIGNATURE_BLOCK → DISCARD
 
-DEFICIENCY CATEGORY — classify into one of: Resident Rights, Advance Directives, Beneficiary Notification, Environment of Care, Medication Management, Abuse and Neglect Investigation, MDS/Assessment Accuracy, Infection Prevention, Accident Prevention, Quality of Care, Pharmacy Services, Administration/Governance
-- deficiency_category: one of the above
-- department_owner: one of: Nursing, Social Services, MDS, Maintenance/Environmental, Administration, Rehabilitation, Medical Records, Pharmacy/Medication Systems, Interdisciplinary Team
+NON-NEGOTIABLE EXCLUSIONS — never include in any output field:
+DEPARTMENT OF HEALTH AND HUMAN SERVICES | CENTERS FOR MEDICARE & MEDICAID SERVICES |
+STATEMENT OF DEFICIENCIES AND PLAN OF CORRECTIONS | FORM APPROVED | OMB NO. 0938-0391 |
+PROVIDER/SUPPLIER/CLIA IDENTIFICATION NUMBER | DATE SURVEY COMPLETED |
+NAME OF PROVIDER OR SUPPLIER | STREET ADDRESS CITY STATE ZIP | ID PREFIX TAG |
+SUMMARY STATEMENT OF DEFICIENCIES | PROVIDER'S PLAN OF CORRECTION | COMPLETION DATE |
+Continued from page X | FORM CMS-2567 | Previous Versions Obsolete |
+Event ID: | Facility ID: | If continuation sheet Page X of Y | signature lines | page numbers
 
-EXTRACTION LOGIC:
-- Everything BEFORE "This REQUIREMENT is NOT MET as evidenced by:" = regulation header
-- Everything AFTER that phrase = deficiency narrative
-- Create one affected_residents entry per named resident
-- Capture dates exactly as written
-- Capture direct quotes exactly as written
-- Keep observations, interviews, and record reviews in separate fields
+CITATION BOUNDARY RULES:
+- Citation STARTS: new F-tag + (SS= or CFR or regulatory title within 300 chars)
+- Citation ENDS: next different F-tag begins, or document ends
+- Same F-tag on continuation page = SAME citation, do NOT start new object
+- F0000 = survey metadata, exclude from citations array entirely
 
-Return ONLY a valid JSON array of citation objects. No markdown. No explanation. Nothing before [ or after ].`;
+REGULATION vs NARRATIVE:
+- BEFORE "This REQUIREMENT is NOT MET as evidenced by:" → federal_requirement_text
+- AFTER that phrase → deficiency_narrative_full
+
+POST-PROCESSING — before returning, verify each citation:
+1. No header/footer boilerplate in any field
+2. No "Continued from page X" text in any field
+3. No column labels in any field
+4. No repeated facility metadata in any field
+5. deficiency_narrative starts only after "This REQUIREMENT is NOT MET"
+6. F0000 excluded
+
+Return one top-level JSON object with survey_metadata and citations array.
+Enable extraction_debug with excluded_text_samples showing what was discarded.
+
+Schema:
+{
+  "survey_metadata": {"provider_name":"","provider_number":"","survey_completed_date":"","facility_address":""},
+  "citations": [{
+    "tag_number": "F####",
+    "scope_severity": "",
+    "scope_severity_raw": "",
+    "regulatory_title": "",
+    "cfr_citations": [],
+    "federal_requirement_text": "",
+    "deficiency_summary": "",
+    "deficiency_narrative_full": "",
+    "sample_scope_text": "",
+    "harm_or_risk_statement": "",
+    "observation_evidence": "",
+    "interview_evidence": "",
+    "record_review_evidence": "",
+    "affected_residents": [{"resident_id":"","citation_specific_issue":"","dates_mentioned":[],"diagnoses_or_conditions":[],"related_staff":[]}],
+    "staff_statements": [],
+    "state_regulatory_references": [],
+    "direct_quotes": [],
+    "deficiency_category": "",
+    "department_owner": "",
+    "poc_inputs": {"core_problem_statement":"","what_failed":"","who_was_affected":"","why_this_matters":"","immediate_correction_candidates":[],"systemic_issue_candidates":[],"monitoring_candidates":[],"training_candidates":[],"documentation_gaps":[]}
+  }],
+  "extraction_debug": {"excluded_text_samples":[],"possible_noise_removed":[]}
+}
+
+Return ONLY valid JSON. Nothing before { or after }.`;
 
     for (let bi = 0; bi < tagBlocks.length; bi += BATCH_SIZE) {
       job.currentChunk = bi + 1;
@@ -760,10 +1078,19 @@ Return ONLY a valid JSON array of citation objects. No markdown. No explanation.
         const resp = await client.send(command);
         const data = JSON.parse(new TextDecoder().decode(resp.body));
         const text = data?.content?.[0]?.text || "";
+        // AI may return array OR top-level object with citations array
+        let batchResults = null;
+        const objStart = text.indexOf("{");
+        const objEnd = text.lastIndexOf("}");
         const arrStart = text.indexOf("[");
         const arrEnd = text.lastIndexOf("]");
-        if (arrStart !== -1 && arrEnd !== -1) {
-          const batchResults = JSON.parse(text.slice(arrStart, arrEnd + 1));
+        if (objStart !== -1 && objEnd !== -1 && objStart < arrStart) {
+          const parsed = JSON.parse(text.slice(objStart, objEnd + 1));
+          batchResults = parsed.citations || (Array.isArray(parsed) ? parsed : null);
+        } else if (arrStart !== -1 && arrEnd !== -1) {
+          batchResults = JSON.parse(text.slice(arrStart, arrEnd + 1));
+        }
+        if (batchResults !== null) {
           batch.forEach((b, i) => {
             const d = batchResults[i] || {};
             allCitations.push({
@@ -800,9 +1127,46 @@ Return ONLY a valid JSON array of citation objects. No markdown. No explanation.
       }
     }
 
+    // ══════════════════════════════════════════════════════════════════════════
+    // STAGE 4 — VALIDATE & NORMALIZE
+    // Run every citation through the validator. Hard fails are flagged but kept
+    // so the user can see them. Only approved_for_poc citations go to generation.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    const surveyUid = jobId;
+    let hardFailCount = 0, humanReviewCount = 0, approvedCount = 0;
+
+    const validatedCitations = allCitations
+      .filter(c => c.tag_number && c.tag_number !== "F0000" && c.tag_number !== "F000")
+      .map(c => {
+        const normalized = normalizeCitation(c, surveyUid);
+        const { status, hardErrors } = validateAndScoreCitation(normalized);
+        if (status === "hard_fail") hardFailCount++;
+        else if (status === "needs_human_review") humanReviewCount++;
+        else approvedCount++;
+        return normalized;
+      });
+
+    // Deduplicate: same tag + same first 80 chars of narrative = true duplicate
+    const seen = new Set();
+    const deduped = validatedCitations.filter(c => {
+      const key = c.tag_number + "|" + (c.deficiency_narrative_full || "").slice(0, 80).trim();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+    console.log("[Parse " + jobId + "] Validated: " + approvedCount + " approved, " + humanReviewCount + " need review, " + hardFailCount + " hard fails, " + deduped.length + " total after dedup");
+
     job.status = "complete";
-    job.result = { facility_name: facilityName2, survey_date: surveyDate2, survey_type: surveyType2, citations: allCitations };
-    console.log("[Parse " + jobId + "] Complete — " + allCitations.length + " citations (deterministic)");
+    job.result = {
+      facility_name: facilityName2,
+      survey_date: surveyDate2,
+      survey_type: surveyType2,
+      citations: deduped,
+      validation_summary: { total: deduped.length, approved: approvedCount, needs_review: humanReviewCount, hard_fails: hardFailCount }
+    };
+    console.log("[Parse " + jobId + "] Complete — " + deduped.length + " citations");
 
   } catch(err) {
     console.error("[Parse " + jobId + "] Fatal:", err.message);
