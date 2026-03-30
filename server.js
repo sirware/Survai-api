@@ -1133,8 +1133,19 @@ Return ONLY valid JSON. Nothing before { or after }.`;
       const batchNum = Math.floor(startIdx / BATCH_SIZE) + 1;
       job.currentChunk = Math.max(job.currentChunk || 0, batchNum);
 
+      // Smart block slicing: always include the narrative section
+      // F-tags with long regulatory preamble (>2500 chars) would lose the narrative at 2500
+      // Strategy: take first 1500 chars (regulatory header) + find narrative start + take 3000 more
+      const sliceBlock = (text) => {
+        const notMetIdx = text.indexOf("NOT MET as evidenced by");
+        if (notMetIdx === -1) return text.slice(0, 5000); // no marker — take as much as possible
+        // Include up to 1500 chars before the marker (regulatory text) + 3500 after (narrative)
+        const headerStart = Math.max(0, notMetIdx - 1500);
+        return text.slice(headerStart, notMetIdx + 3500);
+      };
+
       const batchPrompt = "Extract deficiency citation details for " + blocks.length + " CMS-2567 citation blocks.\n\n" +
-        blocks.map(b => "=== TAG: " + b.tag + " ===\n" + b.text.slice(0, 2500)).join("\n\n") +
+        blocks.map(b => "=== TAG: " + b.tag + " ===\n" + sliceBlock(b.text)).join("\n\n") +
         "\n\nReturn a JSON array with exactly " + blocks.length + " objects in order. " +
         "Each object: {tag_number,scope_severity,scope_severity_raw,regulatory_title,cfr_citations,federal_requirement_text," +
         "deficiency_summary,deficiency_narrative_full,harm_or_risk_statement,observation_evidence,interview_evidence," +
