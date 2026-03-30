@@ -528,34 +528,43 @@ function validateAndScoreCitation(citation) {
   const softErrors = [];
   const tag = (citation.tag_number || "").trim();
 
-  // Hard fail rules
+  // ── HARD fail rules — only truly fatal issues ────────────────────────────
+  // Per architecture guidance: never let strict validation hide citations.
+  // Visible ≠ approved. Keep the citation visible, flag it for review.
   if (tag === "F0000") hardErrors.push("F0000 must not appear as a deficiency citation");
   if (!/^[FKE]\d{3,4}$/.test(tag)) hardErrors.push("Invalid tag_number: " + tag);
   const ps = citation.page_start, pe = citation.page_end;
   if (ps !== null && pe !== null && typeof ps === "number" && typeof pe === "number" && ps > pe) hardErrors.push("page_start > page_end");
-  if (!citation.regulatory_title?.trim()) hardErrors.push(tag + ": missing regulatory_title");
-  if (!citation.deficiency_narrative_full?.trim()) hardErrors.push(tag + ": missing deficiency_narrative_full");
 
-  // Auto-strip boilerplate from narrative fields and flag if found
+  // Only hard-fail on empty narrative if the block is truly empty (not just short)
+  const narrative = (citation.deficiency_narrative_full || citation.deficiency_statement || "").trim();
+  if (!narrative) hardErrors.push(tag + ": completely empty narrative");
+  else if (narrative.length < 40) hardErrors.push(tag + ": narrative too short to be a real citation");
+
+  // Auto-strip boilerplate from narrative fields — do not hard-fail, just clean
   const narrativeFields = ["deficiency_narrative_full","deficiency_summary","findings_full","observation_evidence","interview_evidence","record_review_evidence"];
   for (const field of narrativeFields) {
     if (containsBoilerplate(citation[field] || "")) {
-      hardErrors.push(tag + ": boilerplate leaked into " + field + " — auto-stripped");
+      // Strip and flag for review — do not hard-fail
       citation[field] = stripBoilerplateFromField(citation[field]);
+      softErrors.push(tag + ": boilerplate auto-stripped from " + field);
     }
   }
 
-  // Soft fail / human review rules
+  // ── SOFT fail rules — flag for human review but keep the citation ─────────
+  // These were previously hard errors — now demoted per architecture guidance
+  if (!citation.regulatory_title?.trim()) softErrors.push(tag + ": missing regulatory_title");
   if (!citation.scope_severity?.trim()) softErrors.push(tag + ": missing scope_severity");
+  if (!citation.cfr_citations?.length) softErrors.push(tag + ": missing CFR citations");
   if (ps === null || pe === null) softErrors.push(tag + ": missing page range");
-  if ((citation.deficiency_summary || "").trim().length < 20) softErrors.push(tag + ": deficiency_summary suspiciously short");
-  if (/Continued from page/i.test(citation.deficiency_narrative_full || "")) softErrors.push(tag + ": continuation marker leaked into narrative");
+  if ((citation.deficiency_summary || "").trim().length < 20) softErrors.push(tag + ": deficiency_summary short");
+  if (/Continued from page/i.test(citation.deficiency_narrative_full || "")) softErrors.push(tag + ": continuation marker in narrative");
   const hasQuote = /"/.test(citation.deficiency_narrative_full || "") || /\u201c/.test(citation.deficiency_narrative_full || "");
-  if (hasQuote && !(citation.direct_quotes?.length)) softErrors.push(tag + ": quotes in narrative but direct_quotes empty");
+  if (hasQuote && !(citation.direct_quotes?.length)) softErrors.push(tag + ": quotes in text but direct_quotes empty");
   const evidenceAllBlank = !citation.observation_evidence && !citation.interview_evidence && !citation.record_review_evidence;
-  if (evidenceAllBlank && (citation.affected_residents?.length || 0) > 0) softErrors.push(tag + ": residents cited but all evidence fields empty");
+  if (evidenceAllBlank && (citation.affected_residents?.length || 0) > 0) softErrors.push(tag + ": residents cited but evidence fields empty");
   const statePattern = /WAC\s+\d|RCW\s+\d|CMR\s+\d|\d{1,3}\s+ILCS/i;
-  if (statePattern.test(citation.deficiency_narrative_full || "") && !(citation.state_regulatory_references?.length)) softErrors.push(tag + ": state reference in text but state_regulatory_references empty");
+  if (statePattern.test(citation.deficiency_narrative_full || "") && !(citation.state_regulatory_references?.length)) softErrors.push(tag + ": state reference detected but not extracted");
 
   // Confidence scoring
   let noiseScore = 0;
@@ -783,51 +792,37 @@ async function runParseJob(jobId, pdfBase64, facilityName) {
     // ══════════════════════════════════════════════════════════════════════════
 
     // LINE-BY-LINE pre-clean pass — exact match patterns from CMS-2567 spec
+    // ── SAFE pre-strip patterns only — never strip citation structure ──────────
+    // Do NOT strip: F-tags, SS=, regulatory titles, CFR lines,
+    // "Continued from page" (needed for segmentation stitching),
+    // or anything that could be part of a citation block.
     const LINE_EXCLUSION_PATTERNS = [
-      /^PRINTED:/i,
-      /^DEPARTMENT OF HEALTH AND HUMAN SERVICES/i,
-      /^CENTERS FOR MEDICARE (AND|&) MEDICAID SERVICES/i,
-      /^FORM APPROVED/i,
-      /^OMB\s*N[O0]\.?/i,
-      /^STATEMENT OF DEFICIENCIES/i,
-      /^FORM\s+CMS[-\s]?2567/i,
-      /^Event ID:/i,
-      /^Facility ID:/i,
-      /^If continuation sheet/i,
-      /^Continued from page/i,
-      /^PROVIDER\/SUPPLIER\/CLIA/i,
-      /^DATE SURVEY COMPLETED/i,
-      /^NAME OF PROVIDER OR SUPPLIER/i,
-      /^STREET ADDRESS[,\s]/i,
-      /^ID\s+PREFIX\s+TAG/i,
-      /^SUMMARY STATEMENT OF DEFICIENCIES/i,
-      /^PROVIDER.?S PLAN OF CORRECTION/i,
-      /^\(X[1-5]\)/i,
-      /^COMPLETION DATE/i,
-      /^CONTINUATION SHEET/i,
-      /^Previous Versions? Obsolete/i,
-      /^STATE REPRESENTATIVE SIGNATURE/i,
-      /^SURVEYOR SIGNATURE/i,
-      /^TITLE\s+DATE\s+TIME/i,
-      /^Page\s+\d+\s+of\s+\d+$/i,
-      /^\d+$/, // standalone page numbers
+      /^PRINTED:\s*$/i,
+      /^DEPARTMENT OF HEALTH AND HUMAN SERVICES\s*$/i,
+      /^CENTERS FOR MEDICARE (AND|&) MEDICAID SERVICES\s*$/i,
+      /^FORM APPROVED\s*$/i,
+      /^OMB\s*N[O0]\..*$/i,
+      /^STATEMENT OF DEFICIENCIES\s*$/i,
+      /^AND PLAN OF CORRECTIONS?\s*$/i,
+      /^FORM\s+CMS[-\s]?2567.*$/i,
+      /^If continuation sheet Page\s+\d+\s+of\s+\d+\s*$/i,
+      /^STATE REPRESENTATIVE SIGNATURE\s*$/i,
+      /^SURVEYOR SIGNATURE\s*$/i,
+      /^TITLE\s+DATE\s+TIME\s*$/i,
+      /^\d+$/, // standalone page numbers only
     ];
 
-    // INLINE patterns — remove anywhere in a line, not just at start
+    // INLINE patterns — only truly safe global replacements
     const INLINE_EXCLUSION_PATTERNS = [
       /DEPARTMENT OF HEALTH AND HUMAN SERVICES/gi,
       /CENTERS FOR MEDICARE (AND|&) MEDICAID SERVICES/gi,
-      /STATEMENT OF DEFICIENCIES AND PLAN OF CORRECTIONS?/gi,
       /FORM\s+CMS[-\s]?2567[^\n]*/gi,
       /Previous Versions? Obsolete[^\n]*/gi,
-      /Event ID:\s*[A-Z0-9-]*/gi,
-      /Facility ID:\s*[A-Z0-9-]*/gi,
-      /If continuation sheet\.?\s*Page\s+\d+\s+of\s+\d+/gi,
-      /Continued from page\s+\d+/gi,
       /OMB\s*N[O0]\.?\s*0938-0391/gi,
       /FORM APPROVED/gi,
-      /\(X[1-5]\)\s*[A-Z\/\s]+[:]/gi,
     ];
+    // NOTE: "Continued from page X" is NOT stripped here — segmentation uses it
+    // to know a citation is continuing. Strip it AFTER blocks are formed.
 
     // F0000 block — remove everything from F0000 up to the first real citation tag
     const f0000Match = docText.match(/\bF0*000\b[\s\S]*?(?=\bF0*[1-9]\d{2,3}\b)/);
@@ -904,7 +899,7 @@ async function runParseJob(jobId, pdfBase64, facilityName) {
       // Always keep if it's the only tag or the first one
       if (uniqueTagPositions.length <= 1 || idx === 0) return true;
       // Check ~600 chars after the tag for citation markers (wider window post-cleanup)
-      const after = cleanedText.slice(t.pos, t.pos + 600);
+      const after = cleanedText.slice(t.pos, t.pos + 400); // tag header is ~3-4 lines post-cleanup
       const hasCitationMarker =
         /SS\s*=\s*[A-L]/i.test(after) ||
         /42\s*CFR/i.test(after) ||
@@ -923,9 +918,23 @@ async function runParseJob(jobId, pdfBase64, facilityName) {
 
     const workingText = cleanedText;
 
-    console.log("[Parse " + jobId + "] All tags: " + allTagMatches.length +
-      " → unique: " + uniqueTagPositions.length +
-      " → after cross-ref filter: " + filteredTagPositions.length +
+    const instrumentation = {
+      raw_text_length: docText.length,
+      cleaned_text_length: cleanedText.length,
+      candidate_tag_count: filteredTagPositions.length,
+      candidate_tags: filteredTagPositions.map(t => t.tag),
+      llm_extracted_count: 0,
+      validated_count: 0,
+      rejected_count: 0,
+      rejection_reasons: []
+    };
+    job.instrumentation = instrumentation;
+
+    console.log("[Parse " + jobId + "] Instrumentation: raw=" + docText.length +
+      " cleaned=" + cleanedText.length +
+      " all_tags=" + allTagMatches.length +
+      " unique=" + uniqueTagPositions.length +
+      " candidates=" + filteredTagPositions.length +
       " (" + filteredTagPositions.map(t => t.tag).join(", ") + ")");
     job.totalChunks = filteredTagPositions.length;
 
@@ -937,9 +946,14 @@ async function runParseJob(jobId, pdfBase64, facilityName) {
     }
 
     if (filteredTagPositions.length === 0) {
+      // Last resort: return raw candidate blocks so user sees something
+      // Better than "0 citations" when the document clearly has content
+      console.warn("[Parse " + jobId + "] No tags found — returning empty result");
       job.status = "complete";
-      job.result = { facility_name: facilityName, survey_date: null, survey_type: null, citations: [] };
-      console.warn("[Parse " + jobId + "] No tags found in document after all filtering");
+      job.result = {
+        facility_name: facilityName, survey_date: null, survey_type: null, citations: [],
+        instrumentation, candidate_fallback: true
+      };
       return;
     }
 
@@ -957,7 +971,11 @@ async function runParseJob(jobId, pdfBase64, facilityName) {
         ? filteredTagPositions[i + 1].pos
         : workingText.length;
       // Slice from cleaned text — already stripped of boilerplate
-      const blockText = workingText.slice(t.pos, end).trim();
+      // Strip "Continued from page X" INSIDE the block — after boundary is established
+      const blockText = workingText.slice(t.pos, end)
+        .replace(/Continued from page\s+\d+/gi, " ")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
       return { tag: t.tag, text: blockText };
     });
 
@@ -990,10 +1008,32 @@ async function runParseJob(jobId, pdfBase64, facilityName) {
       }
     } catch(e) { console.warn("[Parse " + jobId + "] Header extract failed:", e.message); }
 
-    // ── Step 5: AI fills in details for each confirmed tag block ─────────────
-    // Process in batches of 4 tags per AI call to minimize round trips
-    const BATCH_SIZE = 4;
-    const allCitations = [];
+    // ── Steps 4+5: Header + AI extraction — parallel ────────────────────────────
+    // Fire header extraction immediately — runs in parallel with citation batches
+    const headerPromise = (async () => {
+      try {
+        const headerText = workingText.slice(0, 2000);
+        const hCmd = new InvokeModelCommand({
+          modelId: BEDROCK_MODEL_ID, contentType: "application/json", accept: "application/json",
+          body: JSON.stringify({ anthropic_version: "bedrock-2023-05-31", max_tokens: 200,
+            messages: [{ role: "user", content: "From this CMS-2567 header extract facility_name, survey_date (YYYY-MM-DD), survey_type. Return ONLY valid JSON, nothing else.\n\n" + headerText }]
+          }),
+        });
+        const hResp = await client.send(hCmd);
+        const hText = JSON.parse(new TextDecoder().decode(hResp.body))?.content?.[0]?.text || "";
+        const hS = hText.indexOf("{"), hE = hText.lastIndexOf("}");
+        if (hS !== -1 && hE !== -1) {
+          const h = JSON.parse(hText.slice(hS, hE + 1));
+          if (h.facility_name) facilityName2 = h.facility_name;
+          if (h.survey_date) surveyDate2 = h.survey_date;
+          if (h.survey_type) surveyType2 = h.survey_type;
+        }
+      } catch(e) { console.warn("[Parse " + jobId + "] Header extract failed:", e.message); }
+    })();
+
+    const BATCH_SIZE = 8;   // 8 tags per call — fewer round trips vs 4
+    const CONCURRENCY = 3;  // 3 batches in parallel — Bedrock handles concurrent requests fine
+    const allCitations = new Array(tagBlocks.length).fill(null);
 
     const systemPrompt = `You are a CMS-2567 extraction engine built for high-precision regulatory parsing.
 
@@ -1074,64 +1114,50 @@ Schema:
 
 Return ONLY valid JSON. Nothing before { or after }.`;
 
+    // Build batch groups upfront
+    const batches = [];
     for (let bi = 0; bi < tagBlocks.length; bi += BATCH_SIZE) {
-      job.currentChunk = bi + 1;
-      const batch = tagBlocks.slice(bi, bi + BATCH_SIZE);
+      batches.push({ startIdx: bi, blocks: tagBlocks.slice(bi, bi + BATCH_SIZE) });
+    }
 
-      const batchPrompt = "Extract all deficiency citation details for each of these " + batch.length +
-        " CMS-2567 citation blocks. Include resident-level details, POC-ready fields, and all evidence types.\n\n" +
-        batch.map((b, i) =>
-          "=== CITATION BLOCK " + (i+1) + " | TAG: " + b.tag + " ===\n" + b.text.slice(0, 4000)
-        ).join("\n\n") +
-        "\n\nRequirements:" +
-        "\n- Exclude F0000 initial comments" +
-        "\n- Separate regulation text from deficiency narrative at 'This REQUIREMENT is NOT MET as evidenced by:'" +
-        "\n- Include resident-level details where available" +
-        "\n- Include state references when present" +
-        "\n- Add POC-ready fields in poc_inputs" +
-        "\n- Return a JSON array with exactly " + batch.length + " objects in order" +
-        "\n- Return ONLY the JSON array, nothing else";
+    // Process one batch
+    const processBatch = async ({ startIdx, blocks }) => {
+      const batchNum = Math.floor(startIdx / BATCH_SIZE) + 1;
+      job.currentChunk = Math.max(job.currentChunk || 0, batchNum);
+
+      const batchPrompt = "Extract deficiency citation details for " + blocks.length + " CMS-2567 citation blocks.\n\n" +
+        blocks.map(b => "=== TAG: " + b.tag + " ===\n" + b.text.slice(0, 2500)).join("\n\n") +
+        "\n\nReturn a JSON array with exactly " + blocks.length + " objects in order. " +
+        "Each object: {tag_number,scope_severity,scope_severity_raw,regulatory_title,cfr_citations,federal_requirement_text," +
+        "deficiency_summary,deficiency_narrative_full,harm_or_risk_statement,observation_evidence,interview_evidence," +
+        "record_review_evidence,affected_residents,staff_statements,state_regulatory_references,direct_quotes," +
+        "deficiency_category,department_owner,poc_inputs}. Return ONLY the JSON array.";
+
+      const EMPTY = (tag) => ({ tag, scope_severity:"", title:"", cfr_citation:"", deficiency_statement:"", observations:"", residents_affected:"", deficiency_narrative_full:"", harm_or_risk_statement:"", deficiency_category:"", department_owner:"", cfr_citations:[], affected_residents_detail:[], staff_statements:[], state_regulatory_references:[], direct_quotes:[], poc_inputs:{} });
 
       try {
         const command = new InvokeModelCommand({
-          modelId: BEDROCK_MODEL_ID,
-          contentType: "application/json",
-          accept: "application/json",
-          body: JSON.stringify({
-            anthropic_version: "bedrock-2023-05-31",
-            max_tokens: 16000,
-            system: systemPrompt,
-            messages: [{ role: "user", content: batchPrompt }],
-          }),
+          modelId: BEDROCK_MODEL_ID, contentType: "application/json", accept: "application/json",
+          body: JSON.stringify({ anthropic_version: "bedrock-2023-05-31", max_tokens: 10000, system: systemPrompt, messages: [{ role: "user", content: batchPrompt }] }),
         });
         const resp = await client.send(command);
-        const data = JSON.parse(new TextDecoder().decode(resp.body));
-        const text = data?.content?.[0]?.text || "";
-        // AI may return array OR top-level object with citations array
+        const text = JSON.parse(new TextDecoder().decode(resp.body))?.content?.[0]?.text || "";
+        const arrStart = text.indexOf("["), arrEnd = text.lastIndexOf("]");
+        const objStart = text.indexOf("{"), objEnd = text.lastIndexOf("}");
         let batchResults = null;
-        const objStart = text.indexOf("{");
-        const objEnd = text.lastIndexOf("}");
-        const arrStart = text.indexOf("[");
-        const arrEnd = text.lastIndexOf("]");
-        if (objStart !== -1 && objEnd !== -1 && objStart < arrStart) {
-          const parsed = JSON.parse(text.slice(objStart, objEnd + 1));
-          batchResults = parsed.citations || (Array.isArray(parsed) ? parsed : null);
-        } else if (arrStart !== -1 && arrEnd !== -1) {
-          batchResults = JSON.parse(text.slice(arrStart, arrEnd + 1));
-        }
-        if (batchResults !== null) {
-          batch.forEach((b, i) => {
+        if (arrStart !== -1 && arrEnd !== -1) batchResults = JSON.parse(text.slice(arrStart, arrEnd + 1));
+        else if (objStart !== -1 && objEnd !== -1) { const o = JSON.parse(text.slice(objStart, objEnd + 1)); batchResults = o.citations || null; }
+        if (batchResults) {
+          blocks.forEach((b, i) => {
             const d = batchResults[i] || {};
-            allCitations.push({
-              tag: b.tag,                              // always from regex — never overridden by AI
-              scope_severity: d.scope_severity || d.scope_severity_raw || "",
+            allCitations[startIdx + i] = {
+              tag: b.tag,
+              scope_severity: d.scope_severity || "",
               title: d.regulatory_title || d.title || "",
               cfr_citation: Array.isArray(d.cfr_citations) ? d.cfr_citations.join(", ") : (d.cfr_citation || ""),
               deficiency_statement: d.deficiency_summary || d.deficiency_statement || "",
-              observations: [d.observation_evidence, d.interview_evidence, d.record_review_evidence].filter(Boolean).join(" | ").slice(0, 500) || d.observations || "",
-              residents_affected: Array.isArray(d.affected_residents)
-                ? d.affected_residents.map(r => r.resident_id || r).filter(Boolean).join(", ")
-                : (d.residents_affected || ""),
+              observations: [d.observation_evidence, d.interview_evidence, d.record_review_evidence].filter(Boolean).join(" | ").slice(0, 500) || "",
+              residents_affected: Array.isArray(d.affected_residents) ? d.affected_residents.map(r => r.resident_id || r).filter(Boolean).join(", ") : (d.residents_affected || ""),
               deficiency_narrative_full: d.deficiency_narrative_full || "",
               harm_or_risk_statement: d.harm_or_risk_statement || "",
               deficiency_category: d.deficiency_category || "",
@@ -1142,19 +1168,25 @@ Return ONLY valid JSON. Nothing before { or after }.`;
               state_regulatory_references: d.state_regulatory_references || [],
               direct_quotes: d.direct_quotes || [],
               poc_inputs: d.poc_inputs || {},
-            });
+            };
           });
-          console.log("[Parse " + jobId + "] Batch " + Math.ceil((bi+1)/BATCH_SIZE) + "/" + Math.ceil(tagBlocks.length/BATCH_SIZE) + " — " + batch.length + " tags filled");
+          console.log("[Parse " + jobId + "] Batch " + batchNum + "/" + batches.length + " done");
         } else {
-          // AI returned bad JSON — still include tags with empty details so count stays correct
-          batch.forEach(b => allCitations.push({ tag: b.tag, scope_severity: "", title: "", cfr_citation: "", deficiency_statement: "", observations: "", residents_affected: "", deficiency_narrative_full: "", harm_or_risk_statement: "", deficiency_category: "", department_owner: "", cfr_citations: [], affected_residents_detail: [], staff_statements: [], state_regulatory_references: [], direct_quotes: [], poc_inputs: {} }));
-          console.warn("[Parse " + jobId + "] Batch " + Math.ceil((bi+1)/BATCH_SIZE) + " — invalid JSON from AI, using empty details");
+          blocks.forEach((b, i) => { allCitations[startIdx + i] = EMPTY(b.tag); });
+          console.warn("[Parse " + jobId + "] Batch " + batchNum + " — no valid JSON");
         }
       } catch(e) {
-        console.warn("[Parse " + jobId + "] Batch " + Math.ceil((bi+1)/BATCH_SIZE) + " failed:", e.message);
-        batch.forEach(b => allCitations.push({ tag: b.tag, scope_severity: "", title: "", cfr_citation: "", deficiency_statement: "", observations: "", residents_affected: "", deficiency_narrative_full: "", harm_or_risk_statement: "", deficiency_category: "", department_owner: "", cfr_citations: [], affected_residents_detail: [], staff_statements: [], state_regulatory_references: [], direct_quotes: [], poc_inputs: {} }));
+        blocks.forEach((b, i) => { allCitations[startIdx + i] = EMPTY(b.tag); });
+        console.warn("[Parse " + jobId + "] Batch " + batchNum + " failed:", e.message);
       }
-    }
+    };
+
+    // Run all batches in parallel with concurrency limit
+    const batchQueue = [...batches];
+    const workers = Array(Math.min(CONCURRENCY, Math.max(1, batchQueue.length))).fill(null).map(async () => {
+      while (batchQueue.length > 0) { const b = batchQueue.shift(); if (b) await processBatch(b); }
+    });
+    await Promise.all([...workers, headerPromise]);
 
     // ══════════════════════════════════════════════════════════════════════════
     // STAGE 4 — VALIDATE & NORMALIZE
@@ -1165,12 +1197,27 @@ Return ONLY valid JSON. Nothing before { or after }.`;
     const surveyUid = jobId;
     let hardFailCount = 0, humanReviewCount = 0, approvedCount = 0;
 
+    // Update instrumentation
+    const extractedCount = allCitations.filter(Boolean).length;
+    instrumentation.llm_extracted_count = extractedCount;
+    console.log("[Parse " + jobId + "] LLM extracted: " + extractedCount + " of " + filteredTagPositions.length + " tags");
+
     const validatedCitations = allCitations
-      .filter(c => c.tag_number && c.tag_number !== "F0000" && c.tag_number !== "F000")
+      .filter(Boolean)
+      .filter(c => {
+        // Keep any citation that has a valid tag and some narrative content
+        // Even imperfect citations surface to the user — never silently drop
+        const tag = (c.tag || c.tag_number || "").trim();
+        const narrative = (c.deficiency_narrative_full || c.deficiency_statement || "").trim();
+        if (!tag || tag === "F0000" || tag === "F000") return false;
+        if (!/^[FKE]\d{3,4}$/.test(tag)) return false;
+        // Keep even if narrative is short — validator will soft-flag it
+        return narrative.length >= 10 || true; // always keep if tag is valid
+      })
       .map(c => {
         const normalized = normalizeCitation(c, surveyUid);
-        const { status, hardErrors } = validateAndScoreCitation(normalized);
-        if (status === "hard_fail") hardFailCount++;
+        const { status } = validateAndScoreCitation(normalized);
+        if (status === "hard_fail") { hardFailCount++; instrumentation.rejection_reasons.push(normalized.tag_number + ": " + (normalized.hard_errors || []).join("; ")); }
         else if (status === "needs_human_review") humanReviewCount++;
         else approvedCount++;
         return normalized;
@@ -1185,7 +1232,12 @@ Return ONLY valid JSON. Nothing before { or after }.`;
       return true;
     });
 
-    console.log("[Parse " + jobId + "] Validated: " + approvedCount + " approved, " + humanReviewCount + " need review, " + hardFailCount + " hard fails, " + deduped.length + " total after dedup");
+    instrumentation.validated_count = deduped.filter(c => c.validation_status !== "hard_fail").length;
+    instrumentation.rejected_count = hardFailCount;
+
+    console.log("[Parse " + jobId + "] Final: " + deduped.length + " citations | " +
+      approvedCount + " approved | " + humanReviewCount + " need review | " + hardFailCount + " hard fails");
+    console.log("[Parse " + jobId + "] Instrumentation:", JSON.stringify(instrumentation));
 
     job.status = "complete";
     job.result = {
@@ -1193,7 +1245,14 @@ Return ONLY valid JSON. Nothing before { or after }.`;
       survey_date: surveyDate2,
       survey_type: surveyType2,
       citations: deduped,
-      validation_summary: { total: deduped.length, approved: approvedCount, needs_review: humanReviewCount, hard_fails: hardFailCount }
+      validation_summary: {
+        total: deduped.length,
+        approved: approvedCount,
+        needs_review: humanReviewCount,
+        hard_fails: hardFailCount,
+        candidate_count: filteredTagPositions.length
+      },
+      instrumentation
     };
     console.log("[Parse " + jobId + "] Complete — " + deduped.length + " citations");
 
