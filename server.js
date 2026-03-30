@@ -19,6 +19,153 @@ const client = new BedrockRuntimeClient({
 
 const BEDROCK_MODEL_ID = "us.anthropic.claude-sonnet-4-5-20250929-v1:0";
 
+// ─── Supabase Client ──────────────────────────────────────────────────────────
+const { createClient } = require("@supabase/supabase-js");
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SECRET_KEY  // service role — bypasses RLS for server writes
+);
+
+// ─── In-memory batch job store ────────────────────────────────────────────────
+// Render Pro keeps the process alive — safe to store in memory between requests
+const batchJobs = new Map();
+
+// ─── POC Generation Helper ────────────────────────────────────────────────────
+async function generatePOCOnServer(citation, facility, guidance, includeDates) {
+  const systemPrompt = `You are a healthcare compliance specialist. Generate a complete Plan of Correction for a CMS deficiency citation. Return ONLY valid JSON, no markdown. Format: {"statement_of_deficiency":"","root_cause_analysis":"","immediate_corrective_actions":"","residents_affected":"","systemic_changes":"","education_and_training":"","policy_procedure_review":"","monitoring_and_auditing":"","sustainability_plan":"","projected_compliance_date":"","attestation":""}`;
+
+  const dateInstruction = includeDates
+    ? "Include specific calendar dates in corrective actions."
+    : "Use relative timeframes only (e.g. 'within 30 days', 'immediately', 'ongoing monthly'). Do NOT include specific calendar dates in the narrative. The projected_compliance_date field should still be a valid YYYY-MM-DD date.";
+
+  const userPrompt = `FACILITY: ${facility.facility_name} (${facility.facility_type || "SNF"}) | CCN: ${facility.facility_id || ""} | State: ${facility.state || ""}
+TAGS: ${citation.tags.join(", ")} | Survey Date: ${citation.survey_date} | Scope/Severity: ${citation.scope_severity}
+DEFICIENCY: ${citation.deficiency_statement}
+${citation.supporting_observations ? "OBSERVATIONS: " + citation.supporting_observations : ""}
+${citation.resident_impact ? "RESIDENT IMPACT: " + citation.resident_impact : ""}
+Survey Date: ${citation.survey_date}
+Compliance Date: ${citation.projected_compliance_date || "10 days from survey date"}
+${guidance ? "GUIDANCE:
+" + guidance.slice(0, 2000) : ""}
+${dateInstruction}
+Generate a complete, professional Plan of Correction. Return ONLY the JSON object.`;
+
+  const bedrockBody = {
+    anthropic_version: "bedrock-2023-05-31",
+    max_tokens: 16000,
+    system: systemPrompt,
+    messages: [{ role: "user", content: userPrompt }],
+  };
+
+  const command = new InvokeModelCommand({
+    modelId: BEDROCK_MODEL_ID,
+    contentType: "application/json",
+    accept: "application/json",
+    body: JSON.stringify(bedrockBody),
+  });
+
+  const response = await client.send(command);
+  const data = JSON.parse(new TextDecoder().decode(response.body));
+  const text = data?.content?.[0]?.text || "";
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start === -1 || end === -1) throw new Error("No JSON in response");
+  return JSON.parse(text.slice(start, end + 1));
+}
+
+// ─── Background Batch Runner ──────────────────────────────────────────────────
+async function runBatchJob(batchId, citations, facility, settings, userId, facilityId) {
+  const job = batchJobs.get(batchId);
+  if (!job) return;
+
+  const CONCURRENCY = 4;
+  const queue = [...citations.map((c, i) => ({ ...c, _idx: i }))];
+  const results = new Array(citations.length).fill(null);
+
+  const processOne = async (item) => {
+    const { _idx, ...citation } = item;
+    let pipData = null;
+    let lastError = null;
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const guidance = ""; // guidance lookup happens client-side; server uses deficiency text
+        pipData = await generatePOCOnServer(citation, facility, guidance, settings.includeDates !== false);
+        break;
+      } catch (err) {
+        lastError = err;
+        if (attempt === 0) await new Promise(r => setTimeout(r, 1500));
+      }
+    }
+
+    if (pipData) {
+      const newPip = {
+        id: "pip-" + Date.now() + "-" + Math.random().toString(36).slice(2),
+        facility: facility.facility_name,
+        facility_id: facilityId,
+        tags: citation.tags || [],
+        survey_date: citation.survey_date,
+        survey_type: citation.survey_type,
+        scope_severity: citation.scope_severity,
+        created_date: new Date().toISOString().split("T")[0],
+        mode: "AI",
+        mode_reason: "Claude API — Server Batch",
+        status: "Draft",
+        sections: pipData,
+        citation_data: citation,
+        batch_id: batchId,
+        source_document: settings.sourceDocument || null,
+        version_history: [],
+        export_history: [],
+      };
+
+      // Save to Supabase immediately so it's available even if client disconnects
+      try {
+        await supabase.from("pocs").insert({
+          id: newPip.id,
+          facility_id: facilityId,
+          facility_name: facility.facility_name,
+          tags: newPip.tags,
+          survey_date: newPip.survey_date,
+          survey_type: newPip.survey_type,
+          scope_severity: newPip.scope_severity,
+          status: "Draft",
+          mode: "AI",
+          sections: newPip.sections,
+          citation_data: newPip.citation_data,
+          batch_id: batchId,
+          created_at: new Date().toISOString(),
+        });
+        console.log(`[Batch ${batchId}] Saved POC for ${citation.tags?.join(",")}`);
+      } catch (dbErr) {
+        console.warn(`[Batch ${batchId}] Supabase save failed for ${citation.tags?.join(",")}: ${dbErr.message}`);
+      }
+
+      results[_idx] = newPip;
+      job.done++;
+    } else {
+      job.failed++;
+      job.errors.push(`${citation.tags?.join(",")}: ${lastError?.message || "Unknown error"}`);
+    }
+
+    job.current = job.done + job.failed;
+    job.completedPips = results.filter(Boolean);
+  };
+
+  // Run with concurrency limit
+  const workers = Array(Math.min(CONCURRENCY, queue.length)).fill(null).map(async () => {
+    while (queue.length > 0) {
+      const item = queue.shift();
+      if (item) await processOne(item);
+    }
+  });
+
+  await Promise.all(workers);
+  job.status = "complete";
+  job.completedAt = new Date().toISOString();
+  console.log(`[Batch ${batchId}] Complete — ${job.done} done, ${job.failed} failed`);
+}
+
 // ─── SendGrid Email Helper ────────────────────────────────────────────────────
 async function sendEmail(to, subject, htmlBody, textBody) {
   const apiKey = process.env.SENDGRID_API_KEY;
@@ -311,98 +458,69 @@ app.post("/api/email/demo", async (req, res) => {
   return res.status(200).json({ success: true });
 });
 
+// ─── Batch Generate — kick off server-side batch, return batchId immediately ──
+app.post("/api/batch/start", async (req, res) => {
+  const { citations, facility, facilityId, settings, userId } = req.body;
+  if (!citations?.length || !facility || !facilityId) {
+    return res.status(400).json({ error: "citations, facility, and facilityId are required" });
+  }
 
-// ─── Supabase Auth Admin Routes ───────────────────────────────────────────────
-// These use the Supabase service role key to manage Auth users server-side
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SECRET_KEY;
+  const batchId = "batch-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
+  const job = {
+    batchId,
+    status: "running",
+    total: citations.length,
+    done: 0,
+    failed: 0,
+    current: 0,
+    errors: [],
+    completedPips: [],
+    startedAt: new Date().toISOString(),
+    completedAt: null,
+    facilityName: facility.facility_name,
+  };
 
-async function supabaseAdminFetch(path, method, body) {
-  const response = await fetch(`${SUPABASE_URL}/auth/v1/admin${path}`, {
-    method,
-    headers: {
-      "Content-Type": "application/json",
-      "apikey": SUPABASE_SERVICE_KEY,
-      "Authorization": `Bearer ${SUPABASE_SERVICE_KEY}`,
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  return response.json();
-}
+  batchJobs.set(batchId, job);
 
-// Create a new Supabase Auth user (called when adding a user in the app)
-app.post("/api/auth/create-user", async (req, res) => {
-  const { email, password, name } = req.body;
-  if (!email || !password) return res.status(400).json({ error: "email and password required" });
-  try {
-    const data = await supabaseAdminFetch("/users", "POST", {
-      email,
-      password,
-      email_confirm: true,
-      user_metadata: { name },
+  // Fire and forget — runs in background, client polls for status
+  runBatchJob(batchId, citations, facility, settings || {}, userId, facilityId)
+    .catch(err => {
+      console.error(`[Batch ${batchId}] Fatal error:`, err.message);
+      const j = batchJobs.get(batchId);
+      if (j) { j.status = "error"; j.errorMessage = err.message; }
     });
-    if (data.error) {
-      // User may already exist — try to update password instead
-      console.warn("Create user error:", data.error);
-      return res.status(200).json({ success: false, reason: data.error.message });
-    }
-    console.log(`Supabase Auth user created: ${email}`);
-    return res.status(200).json({ success: true, id: data.id });
-  } catch (err) {
-    console.error("/api/auth/create-user error:", err.message);
-    return res.status(500).json({ error: err.message });
-  }
+
+  console.log(`[Batch ${batchId}] Started — ${citations.length} citations for ${facility.facility_name}`);
+  return res.status(200).json({ batchId, total: citations.length, status: "running" });
 });
 
-// Reset a user's password in Supabase Auth (called from admin password reset)
-app.post("/api/auth/reset-password", async (req, res) => {
-  const { email, password } = req.body;
-  if (!email || !password) return res.status(400).json({ error: "email and password required" });
-  try {
-    // Find the user by email first
-    const listData = await supabaseAdminFetch(`/users?email=${encodeURIComponent(email)}`, "GET");
-    const user = listData.users?.[0];
-    if (!user) {
-      // User doesn't exist in Supabase Auth yet — create them
-      const createData = await supabaseAdminFetch("/users", "POST", {
-        email,
-        password,
-        email_confirm: true,
-      });
-      if (createData.error) return res.status(400).json({ error: createData.error.message });
-      return res.status(200).json({ success: true, created: true });
-    }
-    // Update existing user's password
-    const updateData = await supabaseAdminFetch(`/users/${user.id}`, "PATCH", { password });
-    if (updateData.error) return res.status(400).json({ error: updateData.error.message });
-    console.log(`Supabase Auth password reset: ${email}`);
-    return res.status(200).json({ success: true });
-  } catch (err) {
-    console.error("/api/auth/reset-password error:", err.message);
-    return res.status(500).json({ error: err.message });
-  }
+// ─── Batch Status — poll this every 5 seconds ─────────────────────────────────
+app.get("/api/batch/status/:batchId", (req, res) => {
+  const job = batchJobs.get(req.params.batchId);
+  if (!job) return res.status(404).json({ error: "Batch not found" });
+  return res.status(200).json({
+    batchId: job.batchId,
+    status: job.status,
+    total: job.total,
+    done: job.done,
+    failed: job.failed,
+    current: job.current,
+    errors: job.errors,
+    startedAt: job.startedAt,
+    completedAt: job.completedAt,
+    facilityName: job.facilityName,
+    // Only return completed pips when batch is done — avoids sending partial data repeatedly
+    completedPips: job.status === "complete" ? job.completedPips : [],
+  });
 });
 
-// Migrate existing users to Supabase Auth (one-time call)
-app.post("/api/auth/migrate-users", async (req, res) => {
-  const { users } = req.body;
-  if (!users?.length) return res.status(400).json({ error: "users array required" });
-  const results = [];
-  for (const u of users) {
-    try {
-      const data = await supabaseAdminFetch("/users", "POST", {
-        email: u.email,
-        password: u.tempPassword,
-        email_confirm: true,
-        user_metadata: { name: u.name },
-      });
-      results.push({ email: u.email, success: !data.error, error: data.error?.message });
-    } catch(e) {
-      results.push({ email: u.email, success: false, error: e.message });
-    }
-  }
-  console.log(`Migration: ${results.filter(r => r.success).length}/${results.length} users created`);
-  return res.status(200).json({ results });
+// ─── Batch Cancel ─────────────────────────────────────────────────────────────
+app.post("/api/batch/cancel/:batchId", (req, res) => {
+  const job = batchJobs.get(req.params.batchId);
+  if (!job) return res.status(404).json({ error: "Batch not found" });
+  job.status = "cancelled";
+  console.log(`[Batch ${job.batchId}] Cancelled by client`);
+  return res.status(200).json({ success: true });
 });
 
 app.listen(PORT, () => console.log(`SurvAI API running on port ${PORT}`));
