@@ -21,6 +21,7 @@ const BEDROCK_MODEL_ID = "us.anthropic.claude-sonnet-4-5-20250929-v1:0";
 
 // ─── Supabase Client ──────────────────────────────────────────────────────────
 const { createClient } = require("@supabase/supabase-js");
+const pdfParse = require("pdf-parse");
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SECRET_KEY  // service role — bypasses RLS for server writes
@@ -455,6 +456,82 @@ app.post("/api/email/demo", async (req, res) => {
   if (!response.ok) { const err = await response.text(); console.error("SendGrid demo error:", err); return res.status(500).json({ error: "Failed to send email" }); }
   console.log(`Demo request from ${name} at ${facility}`);
   return res.status(200).json({ success: true });
+});
+
+// ─── PDF Parse — server-side extraction, column-aware ────────────────────────
+app.post("/api/parse-pdf", async (req, res) => {
+  const { pdfBase64, facilityName } = req.body;
+  if (!pdfBase64) return res.status(400).json({ error: "pdfBase64 is required" });
+
+  try {
+    const pdfBuffer = Buffer.from(pdfBase64, "base64");
+
+    // Custom page renderer — sorts items by Y then X to preserve column structure
+    const pagerender = (pageData) => {
+      return pageData.getTextContent({
+        normalizeWhitespace: false,
+        disableCombineTextItems: false,
+      }).then((textContent) => {
+        if (!textContent.items.length) return "";
+
+        // Group items into lines using Y position (within 4pt = same line)
+        const lineMap = {};
+        for (const item of textContent.items) {
+          if (!item.str || !item.str.trim()) continue;
+          const y = Math.round(item.transform[5]);
+          const bucket = Math.round(y / 4) * 4;
+          if (!lineMap[bucket]) lineMap[bucket] = [];
+          lineMap[bucket].push({ x: item.transform[4], str: item.str, width: item.width || 0 });
+        }
+
+        // Sort buckets top-to-bottom (PDF Y is inverted — higher Y = higher on page)
+        const sortedBuckets = Object.keys(lineMap).map(Number).sort((a, b) => b - a);
+
+        let text = "";
+        let prevBucket = null;
+        for (const bucket of sortedBuckets) {
+          // Add extra blank line when large vertical gap — signals new citation section
+          if (prevBucket !== null && prevBucket - bucket > 18) text += "\n";
+
+          // Sort items left-to-right within each line
+          const line = lineMap[bucket]
+            .sort((a, b) => a.x - b.x)
+            .map(w => w.str)
+            .join(" ")
+            .replace(/\s{3,}/g, "  ")
+            .trim();
+
+          if (line) text += line + "\n";
+          prevBucket = bucket;
+        }
+        return text;
+      });
+    };
+
+    const parsed = await pdfParse(pdfBuffer, { pagerender });
+    let text = parsed.text || "";
+
+    // Post-process — fix common CMS-2567 extraction issues
+    text = text
+      .replace(/([a-z])([A-Z])/g, "$1 $2")
+      .replace(/([A-Z]{2,})([A-Z][a-z])/g, "$1 $2")
+      .replace(/F(\d{3})/g, "\nF$1")
+      .replace(/K(\d{3})/g, "\nK$1")
+      .replace(/E(\d{3})/g, "\nE$1")
+      .replace(/\n{4,}/g, "\n\n\n")
+      .trim();rim();
+
+    console.log(`[PDF Parse] ${facilityName || "Unknown"} — ${parsed.numpages} pages, ${text.length} chars extracted`);
+
+    return res.status(200).json({
+      text,
+      pages: parsed.numpages,
+      chars: text.length,
+    });
+  } catch (err) {
+    console.error("[PDF Parse] Error:", err.message);
+    return res.status(500).json({ error: "PDF extraction failed: " + err.message });
+  }
 });
 
 // ─── Batch Generate — kick off server-side batch, return batchId immediately ──
