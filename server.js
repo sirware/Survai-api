@@ -1,4 +1,20 @@
-},
+const express = require("express");
+const cors = require("cors");
+const { BedrockRuntimeClient, InvokeModelCommand } = require("@aws-sdk/client-bedrock-runtime");
+
+const app = express();
+const PORT = process.env.PORT || 3001;
+
+app.use(cors({ origin: "*" }));
+app.use(express.json({ limit: "10mb" }));
+
+// ─── AWS Bedrock Client ───────────────────────────────────────────────────────
+const client = new BedrockRuntimeClient({
+  region: process.env.AWS_REGION || "us-east-1",
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+  },
 });
 
 const BEDROCK_MODEL_ID = "us.anthropic.claude-sonnet-4-5-20250929-v1:0";
@@ -29,8 +45,7 @@ ${citation.supporting_observations ? "OBSERVATIONS: " + citation.supporting_obse
 ${citation.resident_impact ? "RESIDENT IMPACT: " + citation.resident_impact : ""}
 Survey Date: ${citation.survey_date}
 Compliance Date: ${citation.projected_compliance_date || "10 days from survey date"}
-${guidance ? "GUIDANCE:
-" + guidance.slice(0, 2000) : ""}
+${guidance ? "GUIDANCE: " + guidance.slice(0, 2000) : ""}
 ${dateInstruction}
 Generate a complete, professional Plan of Correction. Return ONLY the JSON object.`;
 
