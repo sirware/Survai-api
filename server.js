@@ -849,14 +849,15 @@ async function runParseJob(jobId, pdfBase64, facilityName) {
           if (p.test(t)) return false;
         }
         // Discard short all-caps lines that are clearly column labels or metadata
-        // (exclude lines that contain an actual F/K/E tag — those are citation headers)
+        // BUT preserve lines containing tags, SS=, CFR, or 483 references
         if (
           t === t.toUpperCase() &&
-          t.length < 80 &&
-          t.split(/\s+/).length <= 8 &&
+          t.length < 60 &&
+          t.split(/\s+/).length <= 6 &&
           !/\b[FKE]\d{3,4}\b/.test(t) &&
           !/SS\s*=/.test(t) &&
-          !/CFR|483\./.test(t)
+          !/CFR|483\./.test(t) &&
+          !/WAC|RCW|CMR/.test(t)
         ) return false;
         return true;
       })
@@ -874,43 +875,71 @@ async function runParseJob(jobId, pdfBase64, facilityName) {
     // context (SS=, CFR, or regulatory title text).
     // ══════════════════════════════════════════════════════════════════════════
 
+    // ── Find ALL F/K/E tag occurrences ───────────────────────────────────────
+    // Collect every occurrence, then deduplicate to first occurrence per tag.
+    // We do NOT gate on proximity here — Stage 1 cleanup may have spread
+    // SS= and CFR text further than 300 chars from the tag.
     const tagPattern = /\b([FKE])(\d{3,4})\b/g;
-    const tagMatches = [];
+    const allTagMatches = [];
     let m;
     while ((m = tagPattern.exec(cleanedText)) !== null) {
       const tag = m[1] + m[2];
       if (tag === "F0000" || tag === "F000") continue;
-      // A citation start: tag must be followed by SS=, regulatory title, or CFR text
-      // within 300 chars — filters out cross-references inside narrative text
-      const after = cleanedText.slice(m.index, m.index + 300);
-      const isCitationStart =
-        /SS\s*=\s*[A-L]/i.test(after) ||
-        /42\s*CFR/i.test(after) ||
-        /483\.\d/i.test(after) ||
-        /This REQUIREMENT/i.test(after) ||
-        tagMatches.length === 0;
-      if (isCitationStart) tagMatches.push({ tag, pos: m.index });
+      allTagMatches.push({ tag, pos: m.index });
     }
 
-    // Keep only FIRST occurrence of each tag — continuation pages repeat the tag
+    // Keep only FIRST occurrence of each tag
     const seenTags = new Set();
     const uniqueTagPositions = [];
-    for (const t of tagMatches) {
+    for (const t of allTagMatches) {
       if (seenTags.has(t.tag)) continue;
       seenTags.add(t.tag);
       uniqueTagPositions.push(t);
     }
 
-    // Replace docText references below with cleanedText
+    // Secondary filter: remove tags that are clearly cross-references, not citation starts.
+    // A cross-reference tag sits inside a sentence (surrounded by word chars or "per"/"see"/"under").
+    // A citation start tag sits at the beginning of a line or is preceded by whitespace only.
+    const filteredTagPositions = uniqueTagPositions.filter((t, idx) => {
+      // Always keep if it's the only tag or the first one
+      if (uniqueTagPositions.length <= 1 || idx === 0) return true;
+      // Check ~600 chars after the tag for citation markers (wider window post-cleanup)
+      const after = cleanedText.slice(t.pos, t.pos + 600);
+      const hasCitationMarker =
+        /SS\s*=\s*[A-L]/i.test(after) ||
+        /42\s*CFR/i.test(after) ||
+        /483\.\d/i.test(after) ||
+        /This REQUIREMENT/i.test(after) ||
+        /NOT MET/i.test(after) ||
+        /deficien/i.test(after.slice(0, 200));
+      // Check 50 chars BEFORE — cross-refs are preceded by "per", "see", "under", "F-tag", etc.
+      const before = cleanedText.slice(Math.max(0, t.pos - 50), t.pos);
+      const likelyCrossRef =
+        /\b(per|see|under|reference|tag|per F|at F|to F|with F|from F)\s*$/i.test(before.trim());
+      if (likelyCrossRef && !hasCitationMarker) return false;
+      // If no citation marker found at all, still keep it — better to include than miss a citation
+      return true;
+    });
+
     const workingText = cleanedText;
 
-    console.log("[Parse " + jobId + "] Regex found " + uniqueTagPositions.length + " tags: " + uniqueTagPositions.map(t => t.tag).join(", "));
-    job.totalChunks = uniqueTagPositions.length;
+    console.log("[Parse " + jobId + "] All tags: " + allTagMatches.length +
+      " → unique: " + uniqueTagPositions.length +
+      " → after cross-ref filter: " + filteredTagPositions.length +
+      " (" + filteredTagPositions.map(t => t.tag).join(", ") + ")");
+    job.totalChunks = filteredTagPositions.length;
 
-    if (uniqueTagPositions.length === 0) {
+    if (filteredTagPositions.length === 0) {
+      // Fallback: if filtering removed everything, use all unique positions
+      // Better to over-include than return zero citations
+      console.warn("[Parse " + jobId + "] Cross-ref filter removed all tags — falling back to all unique positions");
+      filteredTagPositions.push(...uniqueTagPositions);
+    }
+
+    if (filteredTagPositions.length === 0) {
       job.status = "complete";
       job.result = { facility_name: facilityName, survey_date: null, survey_type: null, citations: [] };
-      console.warn("[Parse " + jobId + "] No tags found in document");
+      console.warn("[Parse " + jobId + "] No tags found in document after all filtering");
       return;
     }
 
@@ -923,9 +952,9 @@ async function runParseJob(jobId, pdfBase64, facilityName) {
     // structured field extraction.
     // ══════════════════════════════════════════════════════════════════════════
 
-    const tagBlocks = uniqueTagPositions.map((t, i) => {
-      const end = i + 1 < uniqueTagPositions.length
-        ? uniqueTagPositions[i + 1].pos
+    const tagBlocks = filteredTagPositions.map((t, i) => {
+      const end = i + 1 < filteredTagPositions.length
+        ? filteredTagPositions[i + 1].pos
         : workingText.length;
       // Slice from cleaned text — already stripped of boilerplate
       const blockText = workingText.slice(t.pos, end).trim();
