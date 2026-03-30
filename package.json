@@ -1,6 +1,6 @@
 {
   "name": "survai-api",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "SurvAI Claude API proxy backend",
   "main": "server.js",
   "scripts": {
