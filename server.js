@@ -40,15 +40,22 @@ async function generatePOCOnServer(citation, facility, guidance, includeDates) {
     : "Use relative timeframes only (e.g. 'within 30 days', 'immediately', 'ongoing monthly'). Do NOT include specific calendar dates in the narrative. The projected_compliance_date field should still be a valid YYYY-MM-DD date.";
 
   const userPrompt = `FACILITY: ${facility.facility_name} (${facility.facility_type || "SNF"}) | CCN: ${facility.facility_id || ""} | State: ${facility.state || ""}
-TAGS: ${citation.tags.join(", ")} | Survey Date: ${citation.survey_date} | Scope/Severity: ${citation.scope_severity}
-DEFICIENCY: ${citation.deficiency_statement}
-${citation.supporting_observations ? "OBSERVATIONS: " + citation.supporting_observations : ""}
-${citation.resident_impact ? "RESIDENT IMPACT: " + citation.resident_impact : ""}
-Survey Date: ${citation.survey_date}
+TAG: ${citation.tags?.join(", ")} | Survey Date: ${citation.survey_date} | Scope/Severity: ${citation.scope_severity}
+${citation.title ? "REGULATION: " + citation.title : ""}
+${citation.cfr_citation ? "CFR: " + citation.cfr_citation : ""}
+DEFICIENCY: ${citation.deficiency_statement || citation.deficiency_summary || ""}
+${citation.deficiency_narrative_full ? "FULL NARRATIVE: " + citation.deficiency_narrative_full.slice(0, 800) : ""}
+${citation.harm_or_risk_statement ? "HARM/RISK: " + citation.harm_or_risk_statement : ""}
+${citation.supporting_observations || citation.observations ? "OBSERVATIONS: " + (citation.supporting_observations || citation.observations) : ""}
+${citation.residents_affected || citation.resident_impact ? "RESIDENTS AFFECTED: " + (citation.residents_affected || citation.resident_impact) : ""}
+${citation.deficiency_category ? "CATEGORY: " + citation.deficiency_category : ""}
+${citation.department_owner ? "DEPARTMENT: " + citation.department_owner : ""}
+${citation.poc_inputs?.what_failed ? "WHAT FAILED: " + citation.poc_inputs.what_failed : ""}
+${citation.poc_inputs?.documentation_gaps?.length ? "DOCUMENTATION GAPS: " + citation.poc_inputs.documentation_gaps.join("; ") : ""}
 Compliance Date: ${citation.projected_compliance_date || "10 days from survey date"}
-${guidance ? "GUIDANCE: " + guidance.slice(0, 2000) : ""}
+${guidance ? "GUIDANCE: " + guidance.slice(0, 1500) : ""}
 ${dateInstruction}
-Generate a complete, professional Plan of Correction. Return ONLY the JSON object.`;
+Generate a complete, CMS-acceptable Plan of Correction addressing this specific deficiency. Return ONLY the JSON object.`;
 
   const bedrockBody = {
     anthropic_version: "bedrock-2023-05-31",
@@ -597,91 +604,146 @@ async function runParseJob(jobId, pdfBase64, facilityName) {
     job.status = "parsing";
     console.log("[Parse " + jobId + "] Extracted " + parsed.numpages + " pages, " + docText.length + " chars");
 
-    // ── Step 2: REGEX-FIRST tag detection ─────────────────────────────────────
-    // Regex finds every F/K/E tag deterministically — count is always exact
-    // AI only fills in details for each confirmed tag — never decides what tags exist
+    // ── Step 2: Regex-first — locate every F/K/E tag deterministically ─────────
+    // Tags are the primary delimiter. Regex never misses or invents a tag.
+    // Skip F0000 (initial comments metadata — not a deficiency citation)
     const tagPattern = /\b([FKE])(\d{3,4})\b/g;
     const tagMatches = [];
     let m;
     while ((m = tagPattern.exec(docText)) !== null) {
-      tagMatches.push({ tag: m[1] + m[2], pos: m.index });
+      const tag = m[1] + m[2];
+      if (tag === "F0000" || tag === "F000") continue; // skip initial comments block
+      tagMatches.push({ tag, pos: m.index });
     }
 
-    // Remove duplicate consecutive tags (e.g. tag printed twice in same row)
+    // Deduplicate: same tag within 100 chars = same occurrence (tag printed in header + body)
     const uniqueTagPositions = tagMatches.filter((t, i) => {
       if (i === 0) return true;
       const prev = tagMatches[i - 1];
-      return !(t.tag === prev.tag && t.pos - prev.pos < 50);
+      return !(t.tag === prev.tag && t.pos - prev.pos < 100);
     });
 
     console.log("[Parse " + jobId + "] Regex found " + uniqueTagPositions.length + " tags: " + uniqueTagPositions.map(t => t.tag).join(", "));
     job.totalChunks = uniqueTagPositions.length;
 
-    // Extract survey header info (facility name, date) from first 2000 chars
-    const headerText = docText.slice(0, 2000);
+    if (uniqueTagPositions.length === 0) {
+      job.status = "complete";
+      job.result = { facility_name: facilityName, survey_date: null, survey_type: null, citations: [] };
+      console.warn("[Parse " + jobId + "] No tags found in document");
+      return;
+    }
 
-    // ── Step 3: Extract context window around each tag ────────────────────────
-    // For each tag, grab text from its position to the next tag (or 3000 chars)
-    const tagContexts = uniqueTagPositions.map((t, i) => {
-      const nextPos = i + 1 < uniqueTagPositions.length
+    // ── Step 3: Slice document into per-citation blocks ───────────────────────
+    // Each block = everything from this tag's position to the next tag's position
+    // "Continued from page X" text stays inside the same block — not a new citation
+    const tagBlocks = uniqueTagPositions.map((t, i) => {
+      const end = i + 1 < uniqueTagPositions.length
         ? uniqueTagPositions[i + 1].pos
-        : t.pos + 4000;
-      const context = docText.slice(t.pos, Math.min(nextPos, t.pos + 4000)).trim();
-      return { tag: t.tag, context };
+        : docText.length;
+      const blockText = docText.slice(t.pos, end)
+        .replace(/Continued from page \d+/gi, "") // strip continuation headers
+        .trim();
+      return { tag: t.tag, text: blockText };
     });
 
-    // ── Step 4: Batch AI calls — 5 tags per request to minimize round trips ───
-    const BATCH_SIZE = 5;
-    const allCitations = [];
-    let facilityName2 = null, surveyDate2 = null, surveyType2 = null;
-
-    // Get header info in one quick call
+    // ── Step 4: Extract header info ───────────────────────────────────────────
+    let facilityName2 = facilityName, surveyDate2 = null, surveyType2 = null;
     try {
-      const headerPrompt = "Extract facility name, survey date, and survey type from this CMS-2567 header text. " +
-        "Return ONLY valid JSON with keys facility_name, survey_date (YYYY-MM-DD), survey_type. No extra text.\n\n" + headerText;
+      const headerText = docText.slice(0, 3000);
       const hCmd = new InvokeModelCommand({
         modelId: BEDROCK_MODEL_ID,
         contentType: "application/json",
         accept: "application/json",
-        body: JSON.stringify({ anthropic_version: "bedrock-2023-05-31", max_tokens: 300,
-          messages: [{ role: "user", content: headerPrompt }] }),
+        body: JSON.stringify({
+          anthropic_version: "bedrock-2023-05-31",
+          max_tokens: 300,
+          messages: [{ role: "user", content:
+            "Extract the facility name, survey completion date (YYYY-MM-DD), and survey type from this CMS-2567 header. " +
+            "Return ONLY valid JSON with keys: facility_name, survey_date, survey_type.\n\n" + headerText
+          }]
+        }),
       });
       const hResp = await client.send(hCmd);
       const hData = JSON.parse(new TextDecoder().decode(hResp.body));
       const hText = hData?.content?.[0]?.text || "";
-      const hStart = hText.indexOf("{"); const hEnd = hText.lastIndexOf("}");
-      if (hStart !== -1 && hEnd !== -1) {
-        const hResult = JSON.parse(hText.slice(hStart, hEnd + 1));
-        facilityName2 = hResult.facility_name || facilityName;
-        surveyDate2 = hResult.survey_date || null;
-        surveyType2 = hResult.survey_type || null;
+      const hS = hText.indexOf("{"), hE = hText.lastIndexOf("}");
+      if (hS !== -1 && hE !== -1) {
+        const h = JSON.parse(hText.slice(hS, hE + 1));
+        if (h.facility_name) facilityName2 = h.facility_name;
+        if (h.survey_date) surveyDate2 = h.survey_date;
+        if (h.survey_type) surveyType2 = h.survey_type;
       }
-    } catch(e) { console.warn("[Parse " + jobId + "] Header parse failed:", e.message); }
+    } catch(e) { console.warn("[Parse " + jobId + "] Header extract failed:", e.message); }
 
-    const systemPrompt = `You are a CMS-2567 deficiency citation expert.
-A CMS-2567 is a federal form listing healthcare facility deficiencies. Each citation has:
-- ID Prefix Tag: F followed by 3 digits (e.g. F686, F880), or K-tag, E-tag
-- Scope/Severity: single letter A-L (printed near the tag — D/E/F = lower, G/H/I = actual harm, J/K/L = immediate jeopardy)
-- Summary Statement of Deficiencies: the surveyor's narrative of what violation was found
-- Observations: specific resident identifiers (Resident #1, R#2), dates, staff roles observed
+    // ── Step 5: AI fills in details for each confirmed tag block ─────────────
+    // Process in batches of 4 tags per AI call to minimize round trips
+    const BATCH_SIZE = 4;
+    const allCitations = [];
 
-Return ONLY valid JSON array. No markdown. No explanation.
-Format: [{"tag":"F686","scope_severity":"D","title":"","deficiency_statement":"","observations":"","residents_affected":""}]
+    const systemPrompt = `You are a regulatory document extraction engine specialized in CMS-2567 nursing facility survey documents.
 
-RULES:
-- title: the regulation name (e.g. "Pressure Ulcer Prevention and Treatment")
-- deficiency_statement: 1-2 sentences describing the violation found (max 250 chars)
-- observations: specific evidence from the survey — resident IDs, dates, what was seen (max 300 chars)
-- scope_severity: look for a single capital letter A-L near the tag number
-- If a field is missing from the text, use empty string
-- Return ONLY the JSON array — nothing else`;
+Your job is to extract every deficiency citation from a CMS-2567 Statement of Deficiencies and convert it into clean, structured JSON for downstream compliance workflows including plan-of-correction generation, citation clustering, root-cause analysis, and reporting.
 
-    for (let bi = 0; bi < tagContexts.length; bi += BATCH_SIZE) {
+IMPORTANT PRINCIPLES:
+1. Treat the CMS-2567 as a structured regulatory artifact, not plain narrative text.
+2. A new citation block begins when a new ID Prefix Tag (F####) appears.
+3. A citation may span multiple pages. "Continued from page X" does NOT begin a new citation.
+4. Stop a citation only when the next new deficiency tag begins.
+5. Ignore F0000 Initial Comments — survey metadata, not a deficiency.
+6. Ignore page headers, footers, form labels, continuation boilerplate, and blank plan-of-correction columns.
+7. Preserve factual accuracy. Do not infer facts not clearly stated in the document.
+
+FOR EACH CITATION EXTRACT:
+- tag_number: the F-tag normalized to F#### format
+- scope_severity: the single letter after "SS =" (e.g. D, E, G)
+- scope_severity_raw: exact text such as "SS = D"
+- regulatory_title: short title immediately following the tag
+- cfr_citations: array of all CFR references (e.g. ["483.10(c)(6)", "483.10(g)(12)"])
+- federal_requirement_text: regulatory requirement language BEFORE "This REQUIREMENT is NOT MET"
+- deficiency_summary: the opening surveyor summary of the failed practice (1-3 sentences)
+- deficiency_narrative_full: all text from "This REQUIREMENT is NOT MET as evidenced by:" to end of citation
+- sample_scope_text: phrases like "for 2 of 3 sampled residents"
+- harm_or_risk_statement: surveyor's explicit risk or harm language
+- observation_evidence: what surveyors directly observed
+- interview_evidence: what staff or residents said during interviews
+- record_review_evidence: findings from chart/record review
+- affected_residents: array of objects, one per resident with fields: resident_id, citation_specific_issue, dates_mentioned, diagnoses_or_conditions, related_staff
+- staff_statements: array of concise extracted staff statements
+- state_regulatory_references: array of state regulation references (e.g. WAC citations)
+- direct_quotes: array of verbatim quotes from residents or staff
+- poc_inputs: object with fields: core_problem_statement, what_failed, who_was_affected, why_this_matters, immediate_correction_candidates (array), systemic_issue_candidates (array), monitoring_candidates (array), training_candidates (array), documentation_gaps (array)
+
+DEFICIENCY CATEGORY — classify into one of: Resident Rights, Advance Directives, Beneficiary Notification, Environment of Care, Medication Management, Abuse and Neglect Investigation, MDS/Assessment Accuracy, Infection Prevention, Accident Prevention, Quality of Care, Pharmacy Services, Administration/Governance
+- deficiency_category: one of the above
+- department_owner: one of: Nursing, Social Services, MDS, Maintenance/Environmental, Administration, Rehabilitation, Medical Records, Pharmacy/Medication Systems, Interdisciplinary Team
+
+EXTRACTION LOGIC:
+- Everything BEFORE "This REQUIREMENT is NOT MET as evidenced by:" = regulation header
+- Everything AFTER that phrase = deficiency narrative
+- Create one affected_residents entry per named resident
+- Capture dates exactly as written
+- Capture direct quotes exactly as written
+- Keep observations, interviews, and record reviews in separate fields
+
+Return ONLY a valid JSON array of citation objects. No markdown. No explanation. Nothing before [ or after ].`;
+
+    for (let bi = 0; bi < tagBlocks.length; bi += BATCH_SIZE) {
       job.currentChunk = bi + 1;
-      const batch = tagContexts.slice(bi, bi + BATCH_SIZE);
-      const batchPrompt = "Extract citation details for these " + batch.length + " CMS-2567 deficiency citations.\n\n" +
-        batch.map((t, i) => "--- CITATION " + (i+1) + ": " + t.tag + " ---\n" + t.context).join("\n\n") +
-        "\n\nReturn a JSON array with exactly " + batch.length + " objects, one per citation in order. Return ONLY the JSON array.";
+      const batch = tagBlocks.slice(bi, bi + BATCH_SIZE);
+
+      const batchPrompt = "Extract all deficiency citation details for each of these " + batch.length +
+        " CMS-2567 citation blocks. Include resident-level details, POC-ready fields, and all evidence types.\n\n" +
+        batch.map((b, i) =>
+          "=== CITATION BLOCK " + (i+1) + " | TAG: " + b.tag + " ===\n" + b.text.slice(0, 4000)
+        ).join("\n\n") +
+        "\n\nRequirements:" +
+        "\n- Exclude F0000 initial comments" +
+        "\n- Separate regulation text from deficiency narrative at 'This REQUIREMENT is NOT MET as evidenced by:'" +
+        "\n- Include resident-level details where available" +
+        "\n- Include state references when present" +
+        "\n- Add POC-ready fields in poc_inputs" +
+        "\n- Return a JSON array with exactly " + batch.length + " objects in order" +
+        "\n- Return ONLY the JSON array, nothing else";
 
       try {
         const command = new InvokeModelCommand({
@@ -702,33 +764,45 @@ RULES:
         const arrEnd = text.lastIndexOf("]");
         if (arrStart !== -1 && arrEnd !== -1) {
           const batchResults = JSON.parse(text.slice(arrStart, arrEnd + 1));
-          // Merge AI details with the confirmed tag from regex
-          batch.forEach((t, i) => {
-            const detail = batchResults[i] || {};
+          batch.forEach((b, i) => {
+            const d = batchResults[i] || {};
             allCitations.push({
-              tag: t.tag,                                          // always from regex — never from AI
-              scope_severity: detail.scope_severity || "",
-              title: detail.title || "",
-              deficiency_statement: detail.deficiency_statement || "",
-              observations: detail.observations || "",
-              residents_affected: detail.residents_affected || "",
+              tag: b.tag,                              // always from regex — never overridden by AI
+              scope_severity: d.scope_severity || d.scope_severity_raw || "",
+              title: d.regulatory_title || d.title || "",
+              cfr_citation: Array.isArray(d.cfr_citations) ? d.cfr_citations.join(", ") : (d.cfr_citation || ""),
+              deficiency_statement: d.deficiency_summary || d.deficiency_statement || "",
+              observations: [d.observation_evidence, d.interview_evidence, d.record_review_evidence].filter(Boolean).join(" | ").slice(0, 500) || d.observations || "",
+              residents_affected: Array.isArray(d.affected_residents)
+                ? d.affected_residents.map(r => r.resident_id || r).filter(Boolean).join(", ")
+                : (d.residents_affected || ""),
+              deficiency_narrative_full: d.deficiency_narrative_full || "",
+              harm_or_risk_statement: d.harm_or_risk_statement || "",
+              deficiency_category: d.deficiency_category || "",
+              department_owner: d.department_owner || "",
+              cfr_citations: d.cfr_citations || [],
+              affected_residents_detail: d.affected_residents || [],
+              staff_statements: d.staff_statements || [],
+              state_regulatory_references: d.state_regulatory_references || [],
+              direct_quotes: d.direct_quotes || [],
+              poc_inputs: d.poc_inputs || {},
             });
           });
-          console.log("[Parse " + jobId + "] Batch " + Math.ceil((bi+1)/BATCH_SIZE) + " — filled " + batch.length + " tags");
+          console.log("[Parse " + jobId + "] Batch " + Math.ceil((bi+1)/BATCH_SIZE) + "/" + Math.ceil(tagBlocks.length/BATCH_SIZE) + " — " + batch.length + " tags filled");
         } else {
-          // AI failed to return valid JSON — still include tags with empty details
-          batch.forEach(t => allCitations.push({ tag: t.tag, scope_severity: "", title: "", deficiency_statement: "", observations: "", residents_affected: "" }));
-          console.warn("[Parse " + jobId + "] Batch " + Math.ceil((bi+1)/BATCH_SIZE) + " — no valid JSON, using empty details");
+          // AI returned bad JSON — still include tags with empty details so count stays correct
+          batch.forEach(b => allCitations.push({ tag: b.tag, scope_severity: "", title: "", cfr_citation: "", deficiency_statement: "", observations: "", residents_affected: "", deficiency_narrative_full: "", harm_or_risk_statement: "", deficiency_category: "", department_owner: "", cfr_citations: [], affected_residents_detail: [], staff_statements: [], state_regulatory_references: [], direct_quotes: [], poc_inputs: {} }));
+          console.warn("[Parse " + jobId + "] Batch " + Math.ceil((bi+1)/BATCH_SIZE) + " — invalid JSON from AI, using empty details");
         }
       } catch(e) {
         console.warn("[Parse " + jobId + "] Batch " + Math.ceil((bi+1)/BATCH_SIZE) + " failed:", e.message);
-        batch.forEach(t => allCitations.push({ tag: t.tag, scope_severity: "", title: "", deficiency_statement: "", observations: "", residents_affected: "" }));
+        batch.forEach(b => allCitations.push({ tag: b.tag, scope_severity: "", title: "", cfr_citation: "", deficiency_statement: "", observations: "", residents_affected: "", deficiency_narrative_full: "", harm_or_risk_statement: "", deficiency_category: "", department_owner: "", cfr_citations: [], affected_residents_detail: [], staff_statements: [], state_regulatory_references: [], direct_quotes: [], poc_inputs: {} }));
       }
     }
 
     job.status = "complete";
-    job.result = { facility_name: facilityName2 || facilityName, survey_date: surveyDate2, survey_type: surveyType2, citations: allCitations };
-    console.log("[Parse " + jobId + "] Complete — " + allCitations.length + " citations (regex-confirmed)");
+    job.result = { facility_name: facilityName2, survey_date: surveyDate2, survey_type: surveyType2, citations: allCitations };
+    console.log("[Parse " + jobId + "] Complete — " + allCitations.length + " citations (deterministic)");
 
   } catch(err) {
     console.error("[Parse " + jobId + "] Fatal:", err.message);
