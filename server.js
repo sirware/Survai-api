@@ -597,93 +597,138 @@ async function runParseJob(jobId, pdfBase64, facilityName) {
     job.status = "parsing";
     console.log("[Parse " + jobId + "] Extracted " + parsed.numpages + " pages, " + docText.length + " chars");
 
-    // Step 2: Chunk and send to AI
-    const CHUNK_SIZE = 50000;
-    const OVERLAP = 3000;
-    const chunks = [];
-    for (let i = 0; i < docText.length; i += CHUNK_SIZE - OVERLAP) {
-      chunks.push(docText.slice(i, i + CHUNK_SIZE));
-      if (i + CHUNK_SIZE >= docText.length) break;
+    // ── Step 2: REGEX-FIRST tag detection ─────────────────────────────────────
+    // Regex finds every F/K/E tag deterministically — count is always exact
+    // AI only fills in details for each confirmed tag — never decides what tags exist
+    const tagPattern = /\b([FKE])(\d{3,4})\b/g;
+    const tagMatches = [];
+    let m;
+    while ((m = tagPattern.exec(docText)) !== null) {
+      tagMatches.push({ tag: m[1] + m[2], pos: m.index });
     }
-    job.totalChunks = chunks.length;
 
-    const systemPrompt = `You are a CMS survey document expert. Extract ALL deficiency citations from this CMS-2567 Statement of Deficiencies.
+    // Remove duplicate consecutive tags (e.g. tag printed twice in same row)
+    const uniqueTagPositions = tagMatches.filter((t, i) => {
+      if (i === 0) return true;
+      const prev = tagMatches[i - 1];
+      return !(t.tag === prev.tag && t.pos - prev.pos < 50);
+    });
 
-A CMS-2567 has this structure:
-- Left column: ID Prefix Tag (F-tag like F686, F880, or K-tag, E-tag)
-- Left column: Scope/Severity code (single letter A through L)  
-- Middle column: Summary Statement of Deficiencies — the deficiency text
-- Right column: Provider's Plan of Correction (may be blank in the survey document)
-- Right column: Completion Date
+    console.log("[Parse " + jobId + "] Regex found " + uniqueTagPositions.length + " tags: " + uniqueTagPositions.map(t => t.tag).join(", "));
+    job.totalChunks = uniqueTagPositions.length;
 
-Each citation begins with a tag number (F followed by 3 digits, or K, E followed by digits).
-The deficiency statement describes what was observed and what regulation was violated.
+    // Extract survey header info (facility name, date) from first 2000 chars
+    const headerText = docText.slice(0, 2000);
 
-Return ONLY valid JSON. No markdown. No explanation. Start with { end with }.
-Format: {"facility_name":null,"survey_date":null,"survey_type":null,"citations":[{"tag":"F686","scope_severity":"D","title":"","deficiency_statement":"","observations":"","residents_affected":""}]}
+    // ── Step 3: Extract context window around each tag ────────────────────────
+    // For each tag, grab text from its position to the next tag (or 3000 chars)
+    const tagContexts = uniqueTagPositions.map((t, i) => {
+      const nextPos = i + 1 < uniqueTagPositions.length
+        ? uniqueTagPositions[i + 1].pos
+        : t.pos + 4000;
+      const context = docText.slice(t.pos, Math.min(nextPos, t.pos + 4000)).trim();
+      return { tag: t.tag, context };
+    });
 
-RULES:
-- Extract EVERY citation — missing even one is a failure
-- Same tag can appear multiple times with different deficiencies — include ALL occurrences  
-- scope_severity is a single letter (A-L) — look for it near the tag number
-- deficiency_statement: the full description of what was wrong (up to 200 chars)
-- observations: specific observations made during survey (up to 250 chars)
-- If a field is not found, use empty string — never omit a citation
-- Return ONLY the JSON object`;
-
+    // ── Step 4: Batch AI calls — 5 tags per request to minimize round trips ───
+    const BATCH_SIZE = 5;
     const allCitations = [];
     let facilityName2 = null, surveyDate2 = null, surveyType2 = null;
 
-    for (let ci = 0; ci < chunks.length; ci++) {
-      job.currentChunk = ci + 1;
-      const prompt = "CMS-2567 Survey Document" + (facilityName ? " for " + facilityName : "") + "\n" +
-        "Section " + (ci + 1) + " of " + chunks.length + ":\n\n" + chunks[ci] + "\n\n" +
-        "Extract ALL deficiency citations from this section. Return ONLY the JSON object.";
+    // Get header info in one quick call
+    try {
+      const headerPrompt = "Extract facility name, survey date, and survey type from this CMS-2567 header text. " +
+        "Return ONLY valid JSON with keys facility_name, survey_date (YYYY-MM-DD), survey_type. No extra text.\n\n" + headerText;
+      const hCmd = new InvokeModelCommand({
+        modelId: BEDROCK_MODEL_ID,
+        contentType: "application/json",
+        accept: "application/json",
+        body: JSON.stringify({ anthropic_version: "bedrock-2023-05-31", max_tokens: 300,
+          messages: [{ role: "user", content: headerPrompt }] }),
+      });
+      const hResp = await client.send(hCmd);
+      const hData = JSON.parse(new TextDecoder().decode(hResp.body));
+      const hText = hData?.content?.[0]?.text || "";
+      const hStart = hText.indexOf("{"); const hEnd = hText.lastIndexOf("}");
+      if (hStart !== -1 && hEnd !== -1) {
+        const hResult = JSON.parse(hText.slice(hStart, hEnd + 1));
+        facilityName2 = hResult.facility_name || facilityName;
+        surveyDate2 = hResult.survey_date || null;
+        surveyType2 = hResult.survey_type || null;
+      }
+    } catch(e) { console.warn("[Parse " + jobId + "] Header parse failed:", e.message); }
+
+    const systemPrompt = `You are a CMS-2567 deficiency citation expert.
+A CMS-2567 is a federal form listing healthcare facility deficiencies. Each citation has:
+- ID Prefix Tag: F followed by 3 digits (e.g. F686, F880), or K-tag, E-tag
+- Scope/Severity: single letter A-L (printed near the tag — D/E/F = lower, G/H/I = actual harm, J/K/L = immediate jeopardy)
+- Summary Statement of Deficiencies: the surveyor's narrative of what violation was found
+- Observations: specific resident identifiers (Resident #1, R#2), dates, staff roles observed
+
+Return ONLY valid JSON array. No markdown. No explanation.
+Format: [{"tag":"F686","scope_severity":"D","title":"","deficiency_statement":"","observations":"","residents_affected":""}]
+
+RULES:
+- title: the regulation name (e.g. "Pressure Ulcer Prevention and Treatment")
+- deficiency_statement: 1-2 sentences describing the violation found (max 250 chars)
+- observations: specific evidence from the survey — resident IDs, dates, what was seen (max 300 chars)
+- scope_severity: look for a single capital letter A-L near the tag number
+- If a field is missing from the text, use empty string
+- Return ONLY the JSON array — nothing else`;
+
+    for (let bi = 0; bi < tagContexts.length; bi += BATCH_SIZE) {
+      job.currentChunk = bi + 1;
+      const batch = tagContexts.slice(bi, bi + BATCH_SIZE);
+      const batchPrompt = "Extract citation details for these " + batch.length + " CMS-2567 deficiency citations.\n\n" +
+        batch.map((t, i) => "--- CITATION " + (i+1) + ": " + t.tag + " ---\n" + t.context).join("\n\n") +
+        "\n\nReturn a JSON array with exactly " + batch.length + " objects, one per citation in order. Return ONLY the JSON array.";
 
       try {
-        const bedrockBody = {
-          anthropic_version: "bedrock-2023-05-31",
-          max_tokens: 16000,
-          system: systemPrompt,
-          messages: [{ role: "user", content: prompt }],
-        };
         const command = new InvokeModelCommand({
           modelId: BEDROCK_MODEL_ID,
           contentType: "application/json",
           accept: "application/json",
-          body: JSON.stringify(bedrockBody),
+          body: JSON.stringify({
+            anthropic_version: "bedrock-2023-05-31",
+            max_tokens: 16000,
+            system: systemPrompt,
+            messages: [{ role: "user", content: batchPrompt }],
+          }),
         });
         const resp = await client.send(command);
         const data = JSON.parse(new TextDecoder().decode(resp.body));
         const text = data?.content?.[0]?.text || "";
-        const start = text.indexOf("{");
-        const end = text.lastIndexOf("}");
-        if (start !== -1 && end !== -1) {
-          const chunkResult = JSON.parse(text.slice(start, end + 1));
-          if (!facilityName2 && chunkResult.facility_name) facilityName2 = chunkResult.facility_name;
-          if (!surveyDate2 && chunkResult.survey_date) surveyDate2 = chunkResult.survey_date;
-          if (!surveyType2 && chunkResult.survey_type) surveyType2 = chunkResult.survey_type;
-          if (Array.isArray(chunkResult.citations)) allCitations.push(...chunkResult.citations);
-          console.log("[Parse " + jobId + "] Chunk " + (ci+1) + "/" + chunks.length + " — " + (chunkResult.citations||[]).length + " citations");
+        const arrStart = text.indexOf("[");
+        const arrEnd = text.lastIndexOf("]");
+        if (arrStart !== -1 && arrEnd !== -1) {
+          const batchResults = JSON.parse(text.slice(arrStart, arrEnd + 1));
+          // Merge AI details with the confirmed tag from regex
+          batch.forEach((t, i) => {
+            const detail = batchResults[i] || {};
+            allCitations.push({
+              tag: t.tag,                                          // always from regex — never from AI
+              scope_severity: detail.scope_severity || "",
+              title: detail.title || "",
+              deficiency_statement: detail.deficiency_statement || "",
+              observations: detail.observations || "",
+              residents_affected: detail.residents_affected || "",
+            });
+          });
+          console.log("[Parse " + jobId + "] Batch " + Math.ceil((bi+1)/BATCH_SIZE) + " — filled " + batch.length + " tags");
+        } else {
+          // AI failed to return valid JSON — still include tags with empty details
+          batch.forEach(t => allCitations.push({ tag: t.tag, scope_severity: "", title: "", deficiency_statement: "", observations: "", residents_affected: "" }));
+          console.warn("[Parse " + jobId + "] Batch " + Math.ceil((bi+1)/BATCH_SIZE) + " — no valid JSON, using empty details");
         }
       } catch(e) {
-        console.warn("[Parse " + jobId + "] Chunk " + (ci+1) + " failed:", e.message);
+        console.warn("[Parse " + jobId + "] Batch " + Math.ceil((bi+1)/BATCH_SIZE) + " failed:", e.message);
+        batch.forEach(t => allCitations.push({ tag: t.tag, scope_severity: "", title: "", deficiency_statement: "", observations: "", residents_affected: "" }));
       }
     }
 
-    // Deduplicate: same tag + same first 60 chars of deficiency = duplicate
-    const seen = new Set();
-    const deduped = allCitations.filter(c => {
-      if (!c.tag) return false;
-      const key = (c.tag || "").toUpperCase().trim() + "|" + (c.deficiency_statement || "").slice(0, 60).trim();
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-
     job.status = "complete";
-    job.result = { facility_name: facilityName2 || facilityName, survey_date: surveyDate2, survey_type: surveyType2, citations: deduped };
-    console.log("[Parse " + jobId + "] Complete — " + deduped.length + " unique citations");
+    job.result = { facility_name: facilityName2 || facilityName, survey_date: surveyDate2, survey_type: surveyType2, citations: allCitations };
+    console.log("[Parse " + jobId + "] Complete — " + allCitations.length + " citations (regex-confirmed)");
 
   } catch(err) {
     console.error("[Parse " + jobId + "] Fatal:", err.message);
