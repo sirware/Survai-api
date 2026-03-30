@@ -519,7 +519,7 @@ app.post("/api/parse-pdf", async (req, res) => {
       .replace(/K(\d{3})/g, "\nK$1")
       .replace(/E(\d{3})/g, "\nE$1")
       .replace(/\n{4,}/g, "\n\n\n")
-      .trim();rim();
+      .trim();
 
     console.log(`[PDF Parse] ${facilityName || "Unknown"} — ${parsed.numpages} pages, ${text.length} chars extracted`);
 
