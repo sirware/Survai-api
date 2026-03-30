@@ -99,8 +99,9 @@ async function runBatchJob(batchId, citations, facility, settings, userId, facil
     }
 
     if (pipData) {
+      const pocId = require("crypto").randomUUID();
       const newPip = {
-        id: "pip-" + Date.now() + "-" + Math.random().toString(36).slice(2),
+        id: pocId,
         facility: facility.facility_name,
         facility_id: facilityId,
         tags: citation.tags || [],
@@ -119,7 +120,7 @@ async function runBatchJob(batchId, citations, facility, settings, userId, facil
         export_history: [],
       };
 
-      // Save to Supabase immediately so it's available even if client disconnects
+      // Save to Supabase immediately — all fields needed by dbToLocal mapping
       try {
         await supabase.from("pocs").insert({
           id: newPip.id,
@@ -131,9 +132,18 @@ async function runBatchJob(batchId, citations, facility, settings, userId, facil
           scope_severity: newPip.scope_severity,
           status: "Draft",
           mode: "AI",
+          mode_reason: "Claude API — Server Batch",
+          batch_id: batchId,
+          batch_label: batchLabel,
           sections: newPip.sections,
           citation_data: newPip.citation_data,
-          batch_id: batchId,
+          signers: [],
+          guidance_used: [],
+          export_history: [],
+          version_history: [],
+          archive_outcome: "pending",
+          archived_off: false,
+          source_document: settings.sourceDocument || null,
           created_at: new Date().toISOString(),
         });
         console.log(`[Batch ${batchId}] Saved POC for ${citation.tags?.join(",")}`);
@@ -532,6 +542,186 @@ app.post("/api/parse-pdf", async (req, res) => {
     console.error("[PDF Parse] Error:", err.message);
     return res.status(500).json({ error: "PDF extraction failed: " + err.message });
   }
+});
+
+// ─── Survey Parse — server-side PDF parsing + AI extraction ─────────────────
+// Runs entirely on Render — browser can navigate away, results polled by client
+const parseJobs = new Map();
+
+async function runParseJob(jobId, pdfBase64, facilityName) {
+  const job = parseJobs.get(jobId);
+  if (!job) return;
+
+  try {
+    // Step 1: Extract text from PDF using pdf-parse
+    job.status = "extracting";
+    const pdfBuffer = Buffer.from(pdfBase64, "base64");
+
+    const pagerender = (pageData) => {
+      return pageData.getTextContent({ normalizeWhitespace: false, disableCombineTextItems: false })
+        .then((textContent) => {
+          if (!textContent.items.length) return "";
+          const lineMap = {};
+          for (const item of textContent.items) {
+            if (!item.str || !item.str.trim()) continue;
+            const y = Math.round(item.transform[5]);
+            const bucket = Math.round(y / 4) * 4;
+            if (!lineMap[bucket]) lineMap[bucket] = [];
+            lineMap[bucket].push({ x: item.transform[4], str: item.str });
+          }
+          const sortedBuckets = Object.keys(lineMap).map(Number).sort((a, b) => b - a);
+          let text = "";
+          let prevBucket = null;
+          for (const bucket of sortedBuckets) {
+            if (prevBucket !== null && prevBucket - bucket > 18) text += "\n";
+            const line = lineMap[bucket].sort((a, b) => a.x - b.x).map(w => w.str).join(" ").replace(/\s{3,}/g, "  ").trim();
+            if (line) text += line + "\n";
+            prevBucket = bucket;
+          }
+          return text;
+        });
+    };
+
+    const parsed = await pdfParse(pdfBuffer, { pagerender });
+    let docText = (parsed.text || "")
+      .replace(/([a-z])([A-Z])/g, "$1 $2")
+      .replace(/([A-Z]{2,})([A-Z][a-z])/g, "$1 $2")
+      .replace(/F(\d{3})/g, "\nF$1")
+      .replace(/K(\d{3})/g, "\nK$1")
+      .replace(/E(\d{3})/g, "\nE$1")
+      .replace(/\n{4,}/g, "\n\n\n")
+      .trim();
+
+    job.pages = parsed.numpages;
+    job.chars = docText.length;
+    job.status = "parsing";
+    console.log("[Parse " + jobId + "] Extracted " + parsed.numpages + " pages, " + docText.length + " chars");
+
+    // Step 2: Chunk and send to AI
+    const CHUNK_SIZE = 50000;
+    const OVERLAP = 3000;
+    const chunks = [];
+    for (let i = 0; i < docText.length; i += CHUNK_SIZE - OVERLAP) {
+      chunks.push(docText.slice(i, i + CHUNK_SIZE));
+      if (i + CHUNK_SIZE >= docText.length) break;
+    }
+    job.totalChunks = chunks.length;
+
+    const systemPrompt = `You are a CMS survey document expert. Extract ALL deficiency citations from this CMS-2567 Statement of Deficiencies.
+
+A CMS-2567 has this structure:
+- Left column: ID Prefix Tag (F-tag like F686, F880, or K-tag, E-tag)
+- Left column: Scope/Severity code (single letter A through L)  
+- Middle column: Summary Statement of Deficiencies — the deficiency text
+- Right column: Provider's Plan of Correction (may be blank in the survey document)
+- Right column: Completion Date
+
+Each citation begins with a tag number (F followed by 3 digits, or K, E followed by digits).
+The deficiency statement describes what was observed and what regulation was violated.
+
+Return ONLY valid JSON. No markdown. No explanation. Start with { end with }.
+Format: {"facility_name":null,"survey_date":null,"survey_type":null,"citations":[{"tag":"F686","scope_severity":"D","title":"","deficiency_statement":"","observations":"","residents_affected":""}]}
+
+RULES:
+- Extract EVERY citation — missing even one is a failure
+- Same tag can appear multiple times with different deficiencies — include ALL occurrences  
+- scope_severity is a single letter (A-L) — look for it near the tag number
+- deficiency_statement: the full description of what was wrong (up to 200 chars)
+- observations: specific observations made during survey (up to 250 chars)
+- If a field is not found, use empty string — never omit a citation
+- Return ONLY the JSON object`;
+
+    const allCitations = [];
+    let facilityName2 = null, surveyDate2 = null, surveyType2 = null;
+
+    for (let ci = 0; ci < chunks.length; ci++) {
+      job.currentChunk = ci + 1;
+      const prompt = "CMS-2567 Survey Document" + (facilityName ? " for " + facilityName : "") + "\n" +
+        "Section " + (ci + 1) + " of " + chunks.length + ":\n\n" + chunks[ci] + "\n\n" +
+        "Extract ALL deficiency citations from this section. Return ONLY the JSON object.";
+
+      try {
+        const bedrockBody = {
+          anthropic_version: "bedrock-2023-05-31",
+          max_tokens: 16000,
+          system: systemPrompt,
+          messages: [{ role: "user", content: prompt }],
+        };
+        const command = new InvokeModelCommand({
+          modelId: BEDROCK_MODEL_ID,
+          contentType: "application/json",
+          accept: "application/json",
+          body: JSON.stringify(bedrockBody),
+        });
+        const resp = await client.send(command);
+        const data = JSON.parse(new TextDecoder().decode(resp.body));
+        const text = data?.content?.[0]?.text || "";
+        const start = text.indexOf("{");
+        const end = text.lastIndexOf("}");
+        if (start !== -1 && end !== -1) {
+          const chunkResult = JSON.parse(text.slice(start, end + 1));
+          if (!facilityName2 && chunkResult.facility_name) facilityName2 = chunkResult.facility_name;
+          if (!surveyDate2 && chunkResult.survey_date) surveyDate2 = chunkResult.survey_date;
+          if (!surveyType2 && chunkResult.survey_type) surveyType2 = chunkResult.survey_type;
+          if (Array.isArray(chunkResult.citations)) allCitations.push(...chunkResult.citations);
+          console.log("[Parse " + jobId + "] Chunk " + (ci+1) + "/" + chunks.length + " — " + (chunkResult.citations||[]).length + " citations");
+        }
+      } catch(e) {
+        console.warn("[Parse " + jobId + "] Chunk " + (ci+1) + " failed:", e.message);
+      }
+    }
+
+    // Deduplicate: same tag + same first 60 chars of deficiency = duplicate
+    const seen = new Set();
+    const deduped = allCitations.filter(c => {
+      if (!c.tag) return false;
+      const key = (c.tag || "").toUpperCase().trim() + "|" + (c.deficiency_statement || "").slice(0, 60).trim();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+    job.status = "complete";
+    job.result = { facility_name: facilityName2 || facilityName, survey_date: surveyDate2, survey_type: surveyType2, citations: deduped };
+    console.log("[Parse " + jobId + "] Complete — " + deduped.length + " unique citations");
+
+  } catch(err) {
+    console.error("[Parse " + jobId + "] Fatal:", err.message);
+    job.status = "error";
+    job.error = err.message;
+  }
+}
+
+app.post("/api/parse/start", async (req, res) => {
+  const { pdfBase64, facilityName } = req.body;
+  if (!pdfBase64) return res.status(400).json({ error: "pdfBase64 is required" });
+
+  const jobId = "parse-" + Date.now() + "-" + Math.random().toString(36).slice(2, 7);
+  const job = { jobId, status: "queued", pages: 0, chars: 0, totalChunks: 0, currentChunk: 0, result: null, error: null };
+  parseJobs.set(jobId, job);
+
+  runParseJob(jobId, pdfBase64, facilityName).catch(e => {
+    const j = parseJobs.get(jobId);
+    if (j) { j.status = "error"; j.error = e.message; }
+  });
+
+  console.log("[Parse " + jobId + "] Started for " + (facilityName || "unknown facility"));
+  return res.status(200).json({ jobId });
+});
+
+app.get("/api/parse/status/:jobId", (req, res) => {
+  const job = parseJobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: "Job not found" });
+  return res.status(200).json({
+    jobId: job.jobId,
+    status: job.status,
+    pages: job.pages,
+    chars: job.chars,
+    totalChunks: job.totalChunks,
+    currentChunk: job.currentChunk,
+    result: job.status === "complete" ? job.result : null,
+    error: job.error || null,
+  });
 });
 
 // ─── Batch Generate — kick off server-side batch, return batchId immediately ──
