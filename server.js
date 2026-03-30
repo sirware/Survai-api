@@ -526,7 +526,7 @@ function stripBoilerplateFromField(text) {
 function validateAndScoreCitation(citation) {
   const hardErrors = [];
   const softErrors = [];
-  const tag = (citation.tag_number || "").trim();
+  const tag = (citation.tag_number || citation.tag || "").trim();
 
   // ── HARD fail rules — only truly fatal issues ────────────────────────────
   // Per architecture guidance: never let strict validation hide citations.
@@ -602,10 +602,16 @@ function validateAndScoreCitation(citation) {
 }
 
 function normalizeCitation(citation, surveyUid) {
-  // Normalize tag to F#### (3-digit → pad to 4)
-  if (citation.tag_number && /^[FKE]\d{3}$/.test(citation.tag_number)) {
-    citation.tag_number = citation.tag_number[0] + citation.tag_number.slice(1).padStart(4, "0");
+  // Resolve tag — extraction stores as "tag", schema requires "tag_number"
+  // Always normalize to tag_number regardless of which field it came in as
+  const rawTag = (citation.tag_number || citation.tag || "").trim();
+  // Pad 3-digit tags to 4 digits: F578 → F0578
+  if (/^[FKE]\d{3}$/.test(rawTag)) {
+    citation.tag_number = rawTag[0] + rawTag.slice(1).padStart(4, "0");
+  } else {
+    citation.tag_number = rawTag;
   }
+  delete citation.tag; // remove legacy field
   // Ensure required arrays
   for (const f of ["cfr_citations","affected_residents","staff_statements","administrator_statements","facility_expectation_statements","policy_or_guideline_references","state_regulatory_references","direct_quotes","hard_errors","soft_errors"]) {
     if (!Array.isArray(citation[f])) citation[f] = [];
@@ -844,7 +850,7 @@ async function runParseJob(jobId, pdfBase64, facilityName) {
           if (p.test(t)) return false;
         }
         // Discard short all-caps lines that are clearly column labels or metadata
-        // BUT preserve lines containing tags, SS=, CFR, or 483 references
+        // PRESERVE: lines with F-tags, SS=, CFR, 483, WAC/RCW, §, or regulatory terms
         if (
           t === t.toUpperCase() &&
           t.length < 60 &&
@@ -852,7 +858,9 @@ async function runParseJob(jobId, pdfBase64, facilityName) {
           !/\b[FKE]\d{3,4}\b/.test(t) &&
           !/SS\s*=/.test(t) &&
           !/CFR|483\./.test(t) &&
-          !/WAC|RCW|CMR/.test(t)
+          !/WAC|RCW|CMR/.test(t) &&
+          !/§/.test(t) &&
+          !/NOT MET/i.test(t)
         ) return false;
         return true;
       })
@@ -1133,7 +1141,7 @@ Return ONLY valid JSON. Nothing before { or after }.`;
         "record_review_evidence,affected_residents,staff_statements,state_regulatory_references,direct_quotes," +
         "deficiency_category,department_owner,poc_inputs}. Return ONLY the JSON array.";
 
-      const EMPTY = (tag) => ({ tag, scope_severity:"", title:"", cfr_citation:"", deficiency_statement:"", observations:"", residents_affected:"", deficiency_narrative_full:"", harm_or_risk_statement:"", deficiency_category:"", department_owner:"", cfr_citations:[], affected_residents_detail:[], staff_statements:[], state_regulatory_references:[], direct_quotes:[], poc_inputs:{} });
+      const EMPTY = (tag) => ({ tag, tag_number: tag, scope_severity:"", title:"", cfr_citation:"", deficiency_statement:"", observations:"", residents_affected:"", deficiency_narrative_full:"", harm_or_risk_statement:"", deficiency_category:"", department_owner:"", cfr_citations:[], affected_residents_detail:[], staff_statements:[], state_regulatory_references:[], direct_quotes:[], poc_inputs:{} });
 
       try {
         const command = new InvokeModelCommand({
@@ -1152,6 +1160,7 @@ Return ONLY valid JSON. Nothing before { or after }.`;
             const d = batchResults[i] || {};
             allCitations[startIdx + i] = {
               tag: b.tag,
+              tag_number: b.tag,   // canonical field — always from regex, never from AI
               scope_severity: d.scope_severity || "",
               title: d.regulatory_title || d.title || "",
               cfr_citation: Array.isArray(d.cfr_citations) ? d.cfr_citations.join(", ") : (d.cfr_citation || ""),
