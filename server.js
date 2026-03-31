@@ -960,6 +960,15 @@ VERBATIM TEXT IS SOURCE OF TRUTH.`;
 
     console.log("[Parse " + jobId + "] parseCMS2567 stats:", JSON.stringify(parseResult.stats));
 
+    // Diagnostic: log first citation fields to verify full_deficiency_text is set
+    if (parseResult.citations.length > 0) {
+      const first = parseResult.citations[0];
+      console.log("[Parse " + jobId + "] First citation " + first.tag_number + ": " +
+        "full_deficiency_text=" + (first.full_deficiency_text?.length || 0) + "chars " +
+        "raw_block=" + (first.raw_block?.length || 0) + "chars " +
+        "deficiency_narrative_full=" + (first.deficiency_narrative_full?.length || 0) + "chars");
+    }
+
     const allCitations = parseResult.citations;
     const instrumentation = {
       raw_text_length: docText.length,
