@@ -44,7 +44,7 @@ async function generatePOCOnServer(citation, facility, guidance, includeDates) {
 TAG: ${citation.tags?.join(", ")} | Survey Date: ${citation.survey_date} | Scope/Severity: ${citation.scope_severity}
 ${citation.title ? "REGULATION: " + citation.title : ""}
 ${citation.cfr_citation ? "CFR: " + citation.cfr_citation : ""}
-DEFICIENCY: ${citation.deficiency_statement || citation.deficiency_summary || ""}
+SURVEYOR DEFICIENCY FINDING (verbatim from CMS-2567 — do not alter or repeat this in the POC): ${citation.deficiency_statement || citation.deficiency_summary || ""}
 ${citation.deficiency_narrative_full ? "FULL NARRATIVE: " + citation.deficiency_narrative_full.slice(0, 800) : ""}
 ${citation.harm_or_risk_statement ? "HARM/RISK: " + citation.harm_or_risk_statement : ""}
 ${citation.supporting_observations || citation.observations ? "OBSERVATIONS: " + (citation.supporting_observations || citation.observations) : ""}
@@ -790,6 +790,14 @@ async function runParseJob(jobId, pdfBase64, facilityName) {
 
 
     // Build the AI enrichment function — called per citation by parseCMS2567
+    // Extraction system prompt — separate from POC generation prompt
+    // CRITICAL: extraction must preserve surveyor text verbatim — it is a legal record
+    const extractionSystemPrompt = `You are a CMS-2567 data extraction engine. Extract structured fields from surveyor-written deficiency citations.
+
+CRITICAL LEGAL RULE: The deficiency_narrative_full and deficiency_summary fields must contain the surveyor's EXACT words. Do not paraphrase, summarize, abbreviate, or rephrase. Copy the text verbatim. The CMS-2567 is a legal document — altering the surveyor's language misrepresents the citation and can invalidate the Plan of Correction.
+
+Only exclude: page headers, footers, column labels, continuation markers, and form boilerplate. Preserve all substantive deficiency text exactly as written.`;
+
     const aiExtractor = async ({ tag_number, raw_block, fallback }) => {
       const header = raw_block.slice(0, 800);
       // Fuzzy narrative start detection
@@ -831,7 +839,7 @@ async function runParseJob(jobId, pdfBase64, facilityName) {
         try {
           const command = new InvokeModelCommand({
             modelId: BEDROCK_MODEL_ID, contentType: "application/json", accept: "application/json",
-            body: JSON.stringify({ anthropic_version: "bedrock-2023-05-31", max_tokens: 8000, system: systemPrompt, messages: [{ role: "user", content: prompt }] }),
+            body: JSON.stringify({ anthropic_version: "bedrock-2023-05-31", max_tokens: 8000, system: extractionSystemPrompt, messages: [{ role: "user", content: prompt }] }),
           });
           const resp = await client.send(command);
           const text = JSON.parse(new TextDecoder().decode(resp.body))?.content?.[0]?.text || "";
