@@ -1039,8 +1039,10 @@ async function runParseJob(jobId, pdfBase64, facilityName) {
       } catch(e) { console.warn("[Parse " + jobId + "] Header extract failed:", e.message); }
     })();
 
-    const BATCH_SIZE = 8;   // 8 tags per call — fewer round trips vs 4
-    const CONCURRENCY = 3;  // 3 batches in parallel — Bedrock handles concurrent requests fine
+    // Process ONE tag per AI call — avoids token overflow from large regulatory blocks
+    // 4 tags run in parallel so total time is similar to batching but far more reliable
+    const BATCH_SIZE = 1;
+    const CONCURRENCY = 4;
     const allCitations = new Array(tagBlocks.length).fill(null);
 
     const systemPrompt = `You are a CMS-2567 extraction engine built for high-precision regulatory parsing.
@@ -1144,10 +1146,11 @@ Return ONLY valid JSON. Nothing before { or after }.`;
         return text.slice(headerStart, notMetIdx + 3500);
       };
 
-      const batchPrompt = "Extract deficiency citation details for " + blocks.length + " CMS-2567 citation blocks.\n\n" +
-        blocks.map(b => "=== TAG: " + b.tag + " ===\n" + sliceBlock(b.text)).join("\n\n") +
-        "\n\nReturn a JSON array with exactly " + blocks.length + " objects in order. " +
-        "Each object: {tag_number,scope_severity,scope_severity_raw,regulatory_title,cfr_citations,federal_requirement_text," +
+      const block = blocks[0]; // always 1 tag per call
+      const batchPrompt = "Extract deficiency citation details for tag " + block.tag + " from this CMS-2567 block.\n\n" +
+        sliceBlock(block.text) +
+        "\n\nReturn a JSON array with exactly 1 object. " +
+        "Fields: {tag_number,scope_severity,scope_severity_raw,regulatory_title,cfr_citations,federal_requirement_text," +
         "deficiency_summary,deficiency_narrative_full,harm_or_risk_statement,observation_evidence,interview_evidence," +
         "record_review_evidence,affected_residents,staff_statements,state_regulatory_references,direct_quotes," +
         "deficiency_category,department_owner,poc_inputs}. Return ONLY the JSON array.";
@@ -1157,7 +1160,7 @@ Return ONLY valid JSON. Nothing before { or after }.`;
       try {
         const command = new InvokeModelCommand({
           modelId: BEDROCK_MODEL_ID, contentType: "application/json", accept: "application/json",
-          body: JSON.stringify({ anthropic_version: "bedrock-2023-05-31", max_tokens: 10000, system: systemPrompt, messages: [{ role: "user", content: batchPrompt }] }),
+          body: JSON.stringify({ anthropic_version: "bedrock-2023-05-31", max_tokens: 8000, system: systemPrompt, messages: [{ role: "user", content: batchPrompt }] }),
         });
         const resp = await client.send(command);
         const text = JSON.parse(new TextDecoder().decode(resp.body))?.content?.[0]?.text || "";
