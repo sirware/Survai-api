@@ -47,23 +47,26 @@ async function generatePOCOnServer(citation, facility, guidance, includeDates) {
     ? "Include specific calendar dates in corrective actions."
     : "Use relative timeframes only (e.g. 'within 30 days', 'immediately', 'ongoing monthly'). Do NOT include specific calendar dates in the narrative. The projected_compliance_date field should still be a valid YYYY-MM-DD date.";
 
+  // raw_block / full_deficiency_text is the verbatim surveyor text — primary context for POC
+  // It is never displayed to the user but used here to generate a specific, accurate POC
+  // Send the full verbatim block — no truncation. Even the longest CMS-2567 citation
+  // is ~20,000 chars which is well within Claude's context window.
+  const deficiencyContext = citation.full_deficiency_text || citation.raw_block || citation.deficiency_narrative_full || citation.deficiency_statement || citation.deficiency_summary || "";
+
   const userPrompt = `FACILITY: ${facility.facility_name} (${facility.facility_type || "SNF"}) | CCN: ${facility.facility_id || ""} | State: ${facility.state || ""}
 TAG: ${citation.tags?.join(", ")} | Survey Date: ${citation.survey_date} | Scope/Severity: ${citation.scope_severity}
 ${citation.title ? "REGULATION: " + citation.title : ""}
 ${citation.cfr_citation ? "CFR: " + citation.cfr_citation : ""}
-SURVEYOR DEFICIENCY FINDING (verbatim from CMS-2567 — do not alter or repeat this in the POC): ${citation.deficiency_statement || citation.deficiency_summary || ""}
-${citation.deficiency_narrative_full ? "FULL NARRATIVE: " + citation.deficiency_narrative_full.slice(0, 800) : ""}
-${citation.harm_or_risk_statement ? "HARM/RISK: " + citation.harm_or_risk_statement : ""}
-${citation.supporting_observations || citation.observations ? "OBSERVATIONS: " + (citation.supporting_observations || citation.observations) : ""}
+
+VERBATIM DEFICIENCY TEXT FROM CMS-2567 (do not quote or repeat this in the POC — respond to it):
+${deficiencyContext}
+
+${citation.harm_or_risk_statement ? "HARM/RISK IDENTIFIED: " + citation.harm_or_risk_statement : ""}
 ${citation.residents_affected || citation.resident_impact ? "RESIDENTS AFFECTED: " + (citation.residents_affected || citation.resident_impact) : ""}
-${citation.deficiency_category ? "CATEGORY: " + citation.deficiency_category : ""}
-${citation.department_owner ? "DEPARTMENT: " + citation.department_owner : ""}
-${citation.poc_inputs?.what_failed ? "WHAT FAILED: " + citation.poc_inputs.what_failed : ""}
-${citation.poc_inputs?.documentation_gaps?.length ? "DOCUMENTATION GAPS: " + citation.poc_inputs.documentation_gaps.join("; ") : ""}
 Compliance Date: ${citation.projected_compliance_date || "10 days from survey date"}
 ${guidance ? "GUIDANCE: " + guidance.slice(0, 1500) : ""}
 ${dateInstruction}
-Generate a complete, CMS-acceptable Plan of Correction addressing this specific deficiency. Return ONLY the JSON object.`;
+Generate a complete, CMS-acceptable Plan of Correction that specifically addresses the deficiency above. Return ONLY the JSON object.`;
 
   const bedrockBody = {
     anthropic_version: "bedrock-2023-05-31",
