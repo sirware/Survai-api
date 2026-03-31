@@ -1135,15 +1135,19 @@ Return ONLY valid JSON. Nothing before { or after }.`;
       const batchNum = Math.floor(startIdx / BATCH_SIZE) + 1;
       job.currentChunk = Math.max(job.currentChunk || 0, batchNum);
 
-      // Smart block slicing: always include the narrative section
-      // F-tags with long regulatory preamble (>2500 chars) would lose the narrative at 2500
-      // Strategy: take first 1500 chars (regulatory header) + find narrative start + take 3000 more
+      // Smart block slicing — two-part approach:
+      // Part 1: First 800 chars (tag header: tag number, SS=, CFR, regulatory title)
+      // Part 2: 4000 chars starting from "NOT MET as evidenced by:" (the actual narrative)
+      // This handles tags where regulatory preamble is 5000-8000 chars long
       const sliceBlock = (text) => {
+        const header = text.slice(0, 800); // always capture tag, SS=, CFR lines
         const notMetIdx = text.indexOf("NOT MET as evidenced by");
-        if (notMetIdx === -1) return text.slice(0, 5000); // no marker — take as much as possible
-        // Include up to 1500 chars before the marker (regulatory text) + 3500 after (narrative)
-        const headerStart = Math.max(0, notMetIdx - 1500);
-        return text.slice(headerStart, notMetIdx + 3500);
+        if (notMetIdx === -1) {
+          // No NOT MET marker — return header + first 4000 chars of body
+          return header + "\n\n" + text.slice(800, 4800);
+        }
+        const narrative = text.slice(notMetIdx, notMetIdx + 4000);
+        return header + "\n\n[...regulatory text omitted...]\n\n" + narrative;
       };
 
       const block = blocks[0]; // always 1 tag per call
