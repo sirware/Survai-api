@@ -166,8 +166,23 @@ async function parseCMS2567(rawText, options = {}) {
   const { aiExtractor = null, concurrency = 4 } = options;
   const blocks = segmentCitationBlocks(rawText);
 
+  // Extract F0000 Initial Comments as survey metadata (not a citation)
+  let initialComments = '';
+  try {
+    const cleanedForF0000 = cleanForSegmentation(rawText);
+    const f0000start = cleanedForF0000.search(/F0+\s+INITIAL COMMENTS/i);
+    if (f0000start !== -1) {
+      const afterF0000 = cleanedForF0000.slice(f0000start);
+      const nextTagIdx = afterF0000.search(/\n[FKE]\d{3,4}\s/);
+      const f0000end = nextTagIdx !== -1 ? f0000start + nextTagIdx : f0000start + 2000;
+      initialComments = cleanedForF0000.slice(f0000start, f0000end)
+        .replace(/F0+\s+INITIAL COMMENTS\s*/i, '')
+        .trim();
+    }
+  } catch(e) {}
+
   if (!blocks.length) {
-    return { document_type:'CMS-2567', citations:[], stats:{ candidate_count:0, usable_count:0, ai_count:0, fallback_count:0 } };
+    return { document_type:'CMS-2567', citations:[], initial_comments: initialComments, stats:{ candidate_count:0, usable_count:0, ai_count:0, fallback_count:0 } };
   }
 
   const fallbacks = blocks.map(b => buildFallbackCitation(b.raw_block, b.clean_block, b.tag_number, b.scope_severity_hint));
@@ -176,6 +191,7 @@ async function parseCMS2567(rawText, options = {}) {
     const all = fallbacks.map(c => ({ ...c, requires_human_review: !isMinimallyUsable(c) }));
     return {
       document_type: 'CMS-2567', citations: all,
+      initial_comments: initialComments,
       stats: { candidate_count: blocks.length, usable_count: all.filter(isMinimallyUsable).length, ai_count: 0, fallback_count: all.length },
     };
   }
@@ -215,6 +231,7 @@ async function parseCMS2567(rawText, options = {}) {
   const result = enriched.map((c,i) => c||fallbacks[i]);
   return {
     document_type: 'CMS-2567', citations: result,
+    initial_comments: initialComments,
     stats: {
       candidate_count: blocks.length,
       usable_count: result.filter(isMinimallyUsable).length,
