@@ -966,6 +966,28 @@ async function runParseJob(jobId, pdfBase64, facilityName) {
       approvedCount + " approved | " + humanReviewCount + " need review | " + hardFailCount + " hard fails");
     console.log("[Parse " + jobId + "] Instrumentation:", JSON.stringify(instrumentation));
 
+    // Extract facility/survey metadata from document header (first 2000 chars)
+    let facilityName2 = facilityName || "";
+    let surveyDate2 = null;
+    let surveyType2 = null;
+    try {
+      const hText = docText.slice(0, 2000);
+      // Survey date — look for MM/DD/YYYY near "DATE SURVEY COMPLETED"
+      const dateMatch = hText.match(/DATE SURVEY COMPLETED[\s\S]{0,100}?(\d{2}\/\d{2}\/\d{4})/i);
+      if (dateMatch) {
+        const [m, d, y] = dateMatch[1].split("/");
+        surveyDate2 = y + "-" + m + "-" + d;
+      }
+      // Facility name
+      const nameLines = hText.split("\n");
+      for (let li = 0; li < nameLines.length; li++) {
+        if (/NAME OF PROVIDER OR SUPPLIER/i.test(nameLines[li])) {
+          const nextLine = (nameLines[li + 1] || "").trim();
+          if (nextLine.length >= 3) { facilityName2 = nextLine; break; }
+        }
+      }
+    } catch(e) {}
+
     job.status = "complete";
     // Contingency 9: suggest vision fallback if many stubs or hard fails
     const stubCount = deduped.filter(c => c._stub).length;
