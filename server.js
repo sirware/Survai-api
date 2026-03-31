@@ -927,7 +927,7 @@ async function runParseJob(jobId, pdfBase64, facilityName) {
     // Update instrumentation
     const extractedCount = allCitations.filter(Boolean).length;
     instrumentation.llm_extracted_count = extractedCount;
-    console.log("[Parse " + jobId + "] LLM extracted: " + extractedCount + " of " + filteredTagPositions.length + " tags");
+    console.log("[Parse " + jobId + "] LLM extracted: " + extractedCount + " of " + parseResult.stats.candidate_count + " tags");
 
     const validatedCitations = allCitations
       .filter(Boolean)
@@ -982,7 +982,7 @@ async function runParseJob(jobId, pdfBase64, facilityName) {
         needs_review: humanReviewCount,
         hard_fails: hardFailCount,
         stubs: stubCount,
-        candidate_count: filteredTagPositions.length
+        candidate_count: parseResult.stats.candidate_count
       },
       vision_fallback_suggested: visionFallbackSuggested,
       instrumentation
