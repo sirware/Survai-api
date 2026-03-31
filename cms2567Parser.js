@@ -53,16 +53,16 @@ function cleanBlock(block) {
 function segmentCitationBlocks(rawText) {
   const cleaned = cleanForSegmentation(rawText);
   // Split keeping the delimiter
-  const parts = cleaned.split(/(?=(?:^|\n)F\d{4}(?:\s|$))/m);
+  const parts = cleaned.split(/(?=(?:^|\n)[FKE]\d{4}(?:\s|$))/m);
   const tagMap = new Map();
   const tagOrder = [];
-  const TAG_RE = /^(F\d{4})/;
+  const TAG_RE = /^([FKE]\d{4})/;
 
   for (const part of parts) {
     const m = part.match(TAG_RE);
     if (!m) continue;
     const tag = m[1].toUpperCase();
-    if (tag === 'F0000') continue;
+    if (tag === 'F0000' || tag === 'K0000' || tag === 'E0000') continue;
     if (!tagMap.has(tag)) {
       tagMap.set(tag, part);
       tagOrder.push(tag);
@@ -93,7 +93,7 @@ function buildFallbackCitation(rawBlock, cleanedBlock, tag, scopeSeverity) {
   const escapedTag = tag.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
   const titleM = full.match(new RegExp(escapedTag+'[\\s\\S]{0,500}?SS\\s*=\\s*[A-L]?\\s*([\\s\\S]{0,300}?)\\s*CFR\\(s\\):','i'))
     || full.match(new RegExp(escapedTag+'[\\s\\S]{0,300}?\\n([^\\n]{5,120})\\n','i'));
-  const regTitle = titleM ? normalizeWs(titleM[1]).replace(/^F\d{4}\s*/i,'').replace(/SS\s*=\s*[A-L]/i,'').trim().slice(0,120) : '';
+  const regTitle = titleM ? normalizeWs(titleM[1]).replace(/^[FKE]\d{4}\s*/i,'').replace(/SS\s*=\s*[A-L]/i,'').trim().slice(0,120) : '';
 
   // Federal requirement vs narrative split
   const notMetIdx = full.search(/This REQUIREMENT is NOT MET as evidenced by:/i);
