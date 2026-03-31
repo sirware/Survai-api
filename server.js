@@ -787,6 +787,21 @@ async function runParseJob(jobId, pdfBase64, facilityName) {
 
     job.pages = parsed.numpages;
     job.chars = docText.length;
+
+    // Contingency 4: detect scanned/image-only PDFs
+    // A real CMS-2567 should have substantial text. Under 200 chars/page = likely scanned.
+    const charsPerPage = parsed.numpages > 0 ? docText.length / parsed.numpages : 0;
+    if (docText.length < 500 || charsPerPage < 200) {
+      job.status = "complete";
+      job.result = {
+        facility_name: facilityName, survey_date: null, survey_type: null, citations: [],
+        scanned_document: true,
+        error_hint: "This PDF appears to be a scanned image with no extractable text. Please use a text-based PDF exported from iQIES or your state survey system, or convert this document to a searchable PDF using Adobe Acrobat first."
+      };
+      console.warn("[Parse " + jobId + "] Scanned/image PDF detected — " + docText.length + " chars, " + charsPerPage.toFixed(0) + " chars/page");
+      return;
+    }
+
     job.status = "parsing";
     console.log("[Parse " + jobId + "] Extracted " + parsed.numpages + " pages, " + docText.length + " chars");
 
@@ -882,10 +897,16 @@ async function runParseJob(jobId, pdfBase64, facilityName) {
     // Collect every occurrence, then deduplicate to first occurrence per tag.
     // We do NOT gate on proximity here — Stage 1 cleanup may have spread
     // SS= and CFR text further than 300 chars from the tag.
+    // Contingency 6: normalize alternative tag formats before regex scan
+    // Some older forms use "F-578", "F 578", or inconsistent spacing
+    const normalizedForScan = cleanedText
+      .replace(/\b([FKE])[-\s](\d{3,4})\b/g, "$1$2")  // F-578 → F578, F 578 → F578
+      .replace(/\b([FKE])-(\d{3,4})\b/g, "$1$2");       // belt and suspenders
+
     const tagPattern = /\b([FKE])(\d{3,4})\b/g;
     const allTagMatches = [];
     let m;
-    while ((m = tagPattern.exec(cleanedText)) !== null) {
+    while ((m = tagPattern.exec(normalizedForScan)) !== null) {
       const tag = m[1] + m[2];
       if (tag === "F0000" || tag === "F000") continue;
       allTagMatches.push({ tag, pos: m.index });
@@ -1131,80 +1152,254 @@ Return ONLY valid JSON. Nothing before { or after }.`;
     }
 
     // Process one batch
+    // ── Raw block pre-extraction ─────────────────────────────────────────────
+    // Extracts tag, SS, CFR, title, and best-effort deficiency statement
+    // from raw block text using regex — no AI needed, always works
+    // These values are used as fallback if AI extraction fails or is incomplete
+    const preExtract = (tag, text) => {
+      // SS / Scope-Severity
+      const ssMatch = text.match(/SS\s*=\s*([A-L])/i);
+      const scopeSeverity = ssMatch ? ssMatch[1].toUpperCase() : "";
+
+      // CFR citations
+      const cfrMatches = [...text.matchAll(/483\.\d+[\w().\-]*/g)];
+      const cfrCitations = [...new Set(cfrMatches.map(m => m[0]))];
+
+      // Regulatory title — line immediately after the tag on the same or next line
+      const tagLineMatch = text.match(new RegExp(tag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "[^\n]*\n([^\n]{10,80})"));
+      const rawTitleLine = tagLineMatch ? tagLineMatch[1].trim() : "";
+      // Clean it up — remove repeated tag, SS codes, and CMS boilerplate
+      const title = rawTitleLine
+        .replace(/^F\d{4}\s*/i, "")
+        .replace(/SS\s*=\s*[A-L]/i, "")
+        .replace(/CFR.*/i, "")
+        .trim()
+        .slice(0, 120);
+
+      // Best-effort deficiency statement — text after "NOT MET" or after the 30% mark
+      const narrativeStart = findNarrativeStart(text);
+      const narrativeText = text.slice(narrativeStart, narrativeStart + 600).trim();
+      // First 2 sentences of the narrative make a good deficiency statement
+      const sentences = narrativeText.match(/[^.!?]+[.!?]+/g) || [];
+      const deficiencyStatement = sentences.slice(0, 2).join(" ").trim().slice(0, 350) || narrativeText.slice(0, 250);
+
+      // Observations — look for "Based on observation" or resident mentions
+      const obsMatch = narrativeText.match(/Based on [^.]+\./i);
+      const observations = obsMatch ? obsMatch[0].trim() : "";
+
+      // Residents mentioned
+      const residentMatches = [...narrativeText.matchAll(/Resident\s+\d+/gi)];
+      const residentsAffected = [...new Set(residentMatches.map(m => m[0]))].join(", ");
+
+      return {
+        scope_severity: scopeSeverity,
+        cfr_citations: cfrCitations,
+        cfr_citation: cfrCitations.join(", "),
+        title,
+        deficiency_statement: deficiencyStatement,
+        observations,
+        residents_affected: residentsAffected,
+        _pre_extracted: true,
+      };
+    };
+
+    // ── Minimum viable citation stub (Contingency 8) ────────────────────────
+    // If all extraction attempts fail, use pre-extracted values as fallback
+    // Tag always shows, deficiency statement is best-effort from raw text
+    const STUB = (tag, blockText, reason) => {
+      const pre = preExtract(tag, blockText || "");
+      return {
+        tag, tag_number: tag,
+        scope_severity: pre.scope_severity,
+        title: pre.title,
+        cfr_citation: pre.cfr_citation,
+        cfr_citations: pre.cfr_citations,
+        deficiency_statement: pre.deficiency_statement,
+        observations: pre.observations,
+        residents_affected: pre.residents_affected,
+        deficiency_narrative_full: pre.deficiency_statement, // best effort
+        harm_or_risk_statement: "",
+        deficiency_category: "", department_owner: "",
+        affected_residents_detail: [], staff_statements: [],
+        state_regulatory_references: [], direct_quotes: [], poc_inputs: {},
+        _stub: true, _stub_reason: reason,
+        _pre_extracted: true,
+        requires_human_review: true,
+      };
+    };
+
+    // ── Contingency 1+2: Fuzzy narrative boundary detection ──────────────────
+    // Searches for multiple phrase variants that mark the start of deficiency narrative
+    // Falls back to position-based split if none found (Contingency 2)
+    const findNarrativeStart = (text) => {
+      const markers = [
+        "NOT MET as evidenced by:",
+        "NOT MET as evidenced by",
+        "is not met as evidenced",
+        "not met based on",
+        "Based on observation, interview, and record review",
+        "Based on record review, observation",
+        "Based on observation and interview",
+        "Based on interview and record review",
+        "Based on record review and interview",
+        "Based on observation",
+        "Based on interview",
+        "Based on record review",
+      ];
+      for (const marker of markers) {
+        const idx = text.toLowerCase().indexOf(marker.toLowerCase());
+        if (idx !== -1) return idx;
+      }
+      // Contingency 2: position-based fallback — 30% regulatory, 70% narrative
+      return Math.floor(text.length * 0.3);
+    };
+
+    // ── Contingency 3+4+6: Smart block slicing ───────────────────────────────
+    const sliceBlock = (text, tag) => {
+      // Contingency 3: short blocks — send full text, no slicing needed
+      if (text.length <= 3000) return text;
+
+      // Contingency 6: normalize alternative tag formats (F-578, F 578, K0578 etc.)
+      // These are already normalized upstream but keep header capture flexible
+
+      const header = text.slice(0, 800); // always: tag, SS=, CFR, title
+      const narrativeStart = findNarrativeStart(text);
+
+      if (narrativeStart === -1 || narrativeStart >= text.length - 100) {
+        // Contingency 2: no narrative boundary found — positional split
+        return header + "\n\n" + text.slice(Math.max(800, Math.floor(text.length * 0.3)), Math.floor(text.length * 0.3) + 4000);
+      }
+
+      const narrative = text.slice(narrativeStart, narrativeStart + 4000);
+      return header + "\n\n[...regulatory requirement text...]\n\n" + narrative;
+    };
+
+    // ── Contingency 7: Strip POC column bleed ────────────────────────────────
+    // When PDF extraction merges left+right columns, facility POC text can bleed
+    // into the deficiency narrative. Strip patterns that look like facility responses.
+    const stripPocBleed = (text) => {
+      return text
+        .replace(/PROVIDER.?S PLAN OF CORRECTION[\s\S]{0,50}cross.referenced/gi, "")
+        .replace(/Plan of Correction:[\s\S]{0,2000}/gi, "")
+        .replace(/Corrective Action[\s\S]{0,1000}(Monitor|Audit|Policy|Training)/gi, "")
+        .trim();
+    };
+
+    // ── Single Bedrock call with parsed result extraction ─────────────────────
+    const callBedrock = async (tag, promptText) => {
+      const command = new InvokeModelCommand({
+        modelId: BEDROCK_MODEL_ID, contentType: "application/json", accept: "application/json",
+        body: JSON.stringify({
+          anthropic_version: "bedrock-2023-05-31",
+          max_tokens: 8000,
+          system: systemPrompt,
+          messages: [{ role: "user", content: promptText }]
+        }),
+      });
+      const resp = await client.send(command);
+      const text = JSON.parse(new TextDecoder().decode(resp.body))?.content?.[0]?.text || "";
+      const arrStart = text.indexOf("["), arrEnd = text.lastIndexOf("]");
+      const objStart = text.indexOf("{"), objEnd = text.lastIndexOf("}");
+      if (arrStart !== -1 && arrEnd !== -1) {
+        const arr = JSON.parse(text.slice(arrStart, arrEnd + 1));
+        return arr[0] || null;
+      }
+      if (objStart !== -1 && objEnd !== -1) {
+        const o = JSON.parse(text.slice(objStart, objEnd + 1));
+        return o.citations?.[0] || o || null;
+      }
+      return null;
+    };
+
+    // ── Map AI result to canonical citation object ────────────────────────────
+    const mapResult = (tag, d) => ({
+      tag, tag_number: tag,
+      scope_severity: d.scope_severity || "",
+      title: d.regulatory_title || d.title || "",
+      cfr_citation: Array.isArray(d.cfr_citations) ? d.cfr_citations.join(", ") : (d.cfr_citation || ""),
+      deficiency_statement: d.deficiency_summary || d.deficiency_statement || "",
+      observations: [d.observation_evidence, d.interview_evidence, d.record_review_evidence].filter(Boolean).join(" | ").slice(0, 500) || "",
+      residents_affected: Array.isArray(d.affected_residents) ? d.affected_residents.map(r => r.resident_id || r).filter(Boolean).join(", ") : (d.residents_affected || ""),
+      deficiency_narrative_full: d.deficiency_narrative_full || "",
+      harm_or_risk_statement: d.harm_or_risk_statement || "",
+      deficiency_category: d.deficiency_category || "",
+      department_owner: d.department_owner || "",
+      cfr_citations: d.cfr_citations || [],
+      affected_residents_detail: d.affected_residents || [],
+      staff_statements: d.staff_statements || [],
+      state_regulatory_references: d.state_regulatory_references || [],
+      direct_quotes: d.direct_quotes || [],
+      poc_inputs: d.poc_inputs || {},
+    });
+
     const processBatch = async ({ startIdx, blocks }) => {
       const batchNum = Math.floor(startIdx / BATCH_SIZE) + 1;
       job.currentChunk = Math.max(job.currentChunk || 0, batchNum);
+      const block = blocks[0];
+      const tag = block.tag;
 
-      // Smart block slicing — two-part approach:
-      // Part 1: First 800 chars (tag header: tag number, SS=, CFR, regulatory title)
-      // Part 2: 4000 chars starting from "NOT MET as evidenced by:" (the actual narrative)
-      // This handles tags where regulatory preamble is 5000-8000 chars long
-      const sliceBlock = (text) => {
-        const header = text.slice(0, 800); // always capture tag, SS=, CFR lines
-        const notMetIdx = text.indexOf("NOT MET as evidenced by");
-        if (notMetIdx === -1) {
-          // No NOT MET marker — return header + first 4000 chars of body
-          return header + "\n\n" + text.slice(800, 4800);
-        }
-        const narrative = text.slice(notMetIdx, notMetIdx + 4000);
-        return header + "\n\n[...regulatory text omitted...]\n\n" + narrative;
-      };
+      // Contingency 7: strip POC column bleed before processing
+      const cleanedBlockText = stripPocBleed(block.text);
 
-      const block = blocks[0]; // always 1 tag per call
-      const batchPrompt = "Extract deficiency citation details for tag " + block.tag + " from this CMS-2567 block.\n\n" +
-        sliceBlock(block.text) +
-        "\n\nReturn a JSON array with exactly 1 object. " +
-        "Fields: {tag_number,scope_severity,scope_severity_raw,regulatory_title,cfr_citations,federal_requirement_text," +
-        "deficiency_summary,deficiency_narrative_full,harm_or_risk_statement,observation_evidence,interview_evidence," +
-        "record_review_evidence,affected_residents,staff_statements,state_regulatory_references,direct_quotes," +
-        "deficiency_category,department_owner,poc_inputs}. Return ONLY the JSON array.";
+      const makePrompt = (text) =>
+        "Extract deficiency citation for tag " + tag + " from this CMS-2567 block.\n\n" +
+        text +
+        "\n\nReturn a JSON array with exactly 1 object. Fields: {tag_number,scope_severity," +
+        "scope_severity_raw,regulatory_title,cfr_citations,federal_requirement_text,deficiency_summary," +
+        "deficiency_narrative_full,harm_or_risk_statement,observation_evidence,interview_evidence," +
+        "record_review_evidence,affected_residents,staff_statements,state_regulatory_references," +
+        "direct_quotes,deficiency_category,department_owner,poc_inputs}. Return ONLY the JSON array.";
 
-      const EMPTY = (tag) => ({ tag, tag_number: tag, scope_severity:"", title:"", cfr_citation:"", deficiency_statement:"", observations:"", residents_affected:"", deficiency_narrative_full:"", harm_or_risk_statement:"", deficiency_category:"", department_owner:"", cfr_citations:[], affected_residents_detail:[], staff_statements:[], state_regulatory_references:[], direct_quotes:[], poc_inputs:{} });
+      // Always pre-extract from raw text first — provides baseline values
+      // even if AI extraction fails completely
+      const preExtracted = preExtract(tag, cleanedBlockText);
+      let result = null;
 
       try {
-        const command = new InvokeModelCommand({
-          modelId: BEDROCK_MODEL_ID, contentType: "application/json", accept: "application/json",
-          body: JSON.stringify({ anthropic_version: "bedrock-2023-05-31", max_tokens: 8000, system: systemPrompt, messages: [{ role: "user", content: batchPrompt }] }),
-        });
-        const resp = await client.send(command);
-        const text = JSON.parse(new TextDecoder().decode(resp.body))?.content?.[0]?.text || "";
-        const arrStart = text.indexOf("["), arrEnd = text.lastIndexOf("]");
-        const objStart = text.indexOf("{"), objEnd = text.lastIndexOf("}");
-        let batchResults = null;
-        if (arrStart !== -1 && arrEnd !== -1) batchResults = JSON.parse(text.slice(arrStart, arrEnd + 1));
-        else if (objStart !== -1 && objEnd !== -1) { const o = JSON.parse(text.slice(objStart, objEnd + 1)); batchResults = o.citations || null; }
-        if (batchResults) {
-          blocks.forEach((b, i) => {
-            const d = batchResults[i] || {};
-            allCitations[startIdx + i] = {
-              tag: b.tag,
-              tag_number: b.tag,   // canonical field — always from regex, never from AI
-              scope_severity: d.scope_severity || "",
-              title: d.regulatory_title || d.title || "",
-              cfr_citation: Array.isArray(d.cfr_citations) ? d.cfr_citations.join(", ") : (d.cfr_citation || ""),
-              deficiency_statement: d.deficiency_summary || d.deficiency_statement || "",
-              observations: [d.observation_evidence, d.interview_evidence, d.record_review_evidence].filter(Boolean).join(" | ").slice(0, 500) || "",
-              residents_affected: Array.isArray(d.affected_residents) ? d.affected_residents.map(r => r.resident_id || r).filter(Boolean).join(", ") : (d.residents_affected || ""),
-              deficiency_narrative_full: d.deficiency_narrative_full || "",
-              harm_or_risk_statement: d.harm_or_risk_statement || "",
-              deficiency_category: d.deficiency_category || "",
-              department_owner: d.department_owner || "",
-              cfr_citations: d.cfr_citations || [],
-              affected_residents_detail: d.affected_residents || [],
-              staff_statements: d.staff_statements || [],
-              state_regulatory_references: d.state_regulatory_references || [],
-              direct_quotes: d.direct_quotes || [],
-              poc_inputs: d.poc_inputs || {},
-            };
-          });
-          console.log("[Parse " + jobId + "] Batch " + batchNum + "/" + batches.length + " done");
-        } else {
-          blocks.forEach((b, i) => { allCitations[startIdx + i] = EMPTY(b.tag); });
-          console.warn("[Parse " + jobId + "] Batch " + batchNum + " — no valid JSON");
+        // Attempt 1: smart slice (header + narrative section)
+        const sliced = sliceBlock(cleanedBlockText, tag);
+        result = await callBedrock(tag, makePrompt(sliced));
+
+        // Contingency 5: retry with full block if narrative is empty
+        if (result && !result.deficiency_narrative_full?.trim() && !result.deficiency_summary?.trim()) {
+          console.log("[Parse " + jobId + "] " + tag + " — empty narrative, retrying with full block");
+          result = await callBedrock(tag, makePrompt(cleanedBlockText.slice(0, 6000)));
         }
       } catch(e) {
-        blocks.forEach((b, i) => { allCitations[startIdx + i] = EMPTY(b.tag); });
-        console.warn("[Parse " + jobId + "] Batch " + batchNum + " failed:", e.message);
+        console.warn("[Parse " + jobId + "] " + tag + " attempt 1 failed:", e.message);
+      }
+
+      // Contingency 5: second retry if first attempt returned nothing at all
+      if (!result) {
+        try {
+          console.log("[Parse " + jobId + "] " + tag + " — retrying with full block");
+          result = await callBedrock(tag, makePrompt(cleanedBlockText.slice(0, 6000)));
+        } catch(e) {
+          console.warn("[Parse " + jobId + "] " + tag + " retry failed:", e.message);
+        }
+      }
+
+      if (result) {
+        const mapped = mapResult(tag, result);
+        // Fill any empty AI fields with pre-extracted fallback values
+        if (!mapped.scope_severity) mapped.scope_severity = preExtracted.scope_severity;
+        if (!mapped.title) mapped.title = preExtracted.title;
+        if (!mapped.cfr_citation) mapped.cfr_citation = preExtracted.cfr_citation;
+        if (!mapped.cfr_citations?.length) mapped.cfr_citations = preExtracted.cfr_citations;
+        if (!mapped.deficiency_statement) mapped.deficiency_statement = preExtracted.deficiency_statement;
+        if (!mapped.observations) mapped.observations = preExtracted.observations;
+        if (!mapped.residents_affected) mapped.residents_affected = preExtracted.residents_affected;
+        // If AI narrative is empty, use pre-extracted as fallback
+        if (!mapped.deficiency_narrative_full?.trim()) {
+          mapped.deficiency_narrative_full = preExtracted.deficiency_statement;
+          mapped._pre_extracted_fallback = true;
+        }
+        allCitations[startIdx] = mapped;
+        console.log("[Parse " + jobId + "] " + tag + " extracted (batch " + batchNum + "/" + batches.length + ")");
+      } else {
+        // Contingency 8: use pre-extracted stub — always has tag + best-effort content
+        allCitations[startIdx] = STUB(tag, cleanedBlockText, "AI extraction failed — using regex fallback");
+        console.warn("[Parse " + jobId + "] " + tag + " — AI failed, using pre-extracted stub");
       }
     };
 
@@ -1267,6 +1462,10 @@ Return ONLY valid JSON. Nothing before { or after }.`;
     console.log("[Parse " + jobId + "] Instrumentation:", JSON.stringify(instrumentation));
 
     job.status = "complete";
+    // Contingency 9: suggest vision fallback if many stubs or hard fails
+    const stubCount = deduped.filter(c => c._stub).length;
+    const visionFallbackSuggested = stubCount > 0 || hardFailCount > Math.floor(deduped.length * 0.3);
+
     job.result = {
       facility_name: facilityName2,
       survey_date: surveyDate2,
@@ -1277,8 +1476,10 @@ Return ONLY valid JSON. Nothing before { or after }.`;
         approved: approvedCount,
         needs_review: humanReviewCount,
         hard_fails: hardFailCount,
+        stubs: stubCount,
         candidate_count: filteredTagPositions.length
       },
+      vision_fallback_suggested: visionFallbackSuggested,
       instrumentation
     };
     console.log("[Parse " + jobId + "] Complete — " + deduped.length + " citations");
