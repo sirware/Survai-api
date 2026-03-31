@@ -216,7 +216,7 @@ async function parseCMS2567(rawText, options = {}) {
             requires_human_review: !isMinimallyUsable(base),
           };
           // Never let AI blank out a fallback field
-          for (const f of ['scope_severity','title','regulatory_title','cfr_citations','cfr_citation','deficiency_statement','deficiency_summary']) {
+          for (const f of ['scope_severity','title','regulatory_title','cfr_citations','cfr_citation','deficiency_statement','deficiency_summary','federal_requirement_text','harm_or_risk_statement']) {
             if (!enriched[idx][f] && base[f]) enriched[idx][f] = base[f];
           }
         } else {
