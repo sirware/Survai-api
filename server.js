@@ -643,22 +643,31 @@ function normalizeCitation(citation, surveyUid) {
 
 function canGeneratePOC(citation) {
   if (!citation) return { allowed: false, reason: "No citation object" };
-  if (citation.validation_status === "hard_fail") {
+
+  // Hard block: explicit hard_fail from validator (only when scores are actually set)
+  if (citation.validation_status === "hard_fail" && citation.noise_score !== undefined) {
     return { allowed: false, reason: "Hard validation failure: " + (citation.hard_errors || []).join("; ") };
   }
-  if ((citation.noise_score || 0) > 0.35) {
+
+  // Hard block: noise/confidence scores only apply when they were actually computed
+  // User-confirmed citations won't have these fields — don't block them
+  if (citation.noise_score !== undefined && citation.noise_score > 0.5) {
     return { allowed: false, reason: "Noise score too high: " + citation.noise_score };
   }
-  if ((citation.boundary_confidence || 1) < 0.5) {
+  if (citation.boundary_confidence !== undefined && citation.boundary_confidence < 0.3) {
     return { allowed: false, reason: "Boundary confidence too low: " + citation.boundary_confidence };
   }
-  if (!citation.deficiency_narrative_full?.trim() && !citation.deficiency_statement?.trim()) {
-    return { allowed: false, reason: "No deficiency narrative — cannot generate meaningful POC" };
+
+  // Hard block: no tag at all
+  if (!citation.tags?.length && !citation.tag && !citation.tag_number) {
+    return { allowed: false, reason: "No tag — cannot generate POC" };
   }
-  // Needs human review is allowed but flagged
+
+  // Soft flag: needs review but still allowed through
   if (citation.requires_human_review || citation.validation_status === "needs_human_review") {
-    return { allowed: true, flagged: true, reason: "Needs human review: " + (citation.soft_errors || []).join("; ") };
+    return { allowed: true, flagged: true, reason: "Needs human review" };
   }
+
   return { allowed: true, flagged: false, reason: null };
 }
 
