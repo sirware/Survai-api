@@ -792,39 +792,113 @@ async function runParseJob(jobId, pdfBase64, facilityName) {
 
 
     // Build the AI enrichment function — called per citation by parseCMS2567
-    // Verbatim extraction prompt — per CMS-2567 legal compliance spec
+    // Verbatim extraction system prompt — definitive CMS-2567 spec
     const extractionSystemPrompt = `You are extracting Statements of Deficiencies from a CMS-2567.
 
-CRITICAL REQUIREMENT: You must capture ALL deficiency text VERBATIM.
-Do NOT summarize, paraphrase, shorten, or modify any wording.
+==================================================
+CRITICAL LEGAL REQUIREMENT — VERBATIM EXTRACTION
+==================================================
 
-CORE RULE — F-TAG BLOCK EXTRACTION:
+All deficiency text MUST be captured VERBATIM.
+
+DO NOT:
+- summarize
+- paraphrase
+- rewrite
+- shorten
+- clean grammar
+- interpret meaning
+- remove repetition
+- convert format
+
+Return the exact wording as written by the surveyor.
+
+==================================================
+CORE STRUCTURE RULE — F-TAG BASED
+==================================================
+
 Each F-tag (F####) represents ONE deficiency citation.
-A citation starts at an F-tag, continues across pages if needed, ends ONLY when a DIFFERENT F-tag begins.
+A citation STARTS at the F-tag header line.
+A citation ENDS only when a DIFFERENT F-tag begins.
 
-WHAT YOU MUST CAPTURE (VERBATIM) for each F-tag:
-- scope/severity (SS = D, etc.)
-- regulatory title
-- CFR citation(s)
-- ALL federal requirement text
-- the phrase: "This REQUIREMENT is NOT MET as evidenced by:"
-- the FULL deficiency narrative including: Based on…, The facility failed to…, sample/scope, risk statement, Findings included…, ALL resident-level details, ALL interviews, ALL observations, ALL record reviews, ALL staff statements, ALL state references
+==================================================
+F-TAG ALIGNMENT RULE (CRITICAL)
+==================================================
 
-VERBATIM RULES (MANDATORY):
-- DO NOT rewrite text
-- DO NOT clean grammar
-- DO NOT summarize
-- DO NOT remove repetition
-- DO NOT shorten content
-Return EXACT TEXT as it appears in the document.
+Each citation MUST begin exactly at the F-tag line.
+The FIRST line of each extracted citation MUST contain the F-tag and SS = severity.
+DO NOT start extraction mid-paragraph or attach content to the wrong F-tag.
 
-EXCLUDE ONLY: page headers, page footers, facility address blocks, column labels, signature sections, F0000 Initial Comments.
+==================================================
+MULTI-PAGE CONTINUATION RULE
+==================================================
 
-FAILSAFE: If unsure whether text belongs → INCLUDE it.
+If the same F-tag appears again OR text includes "Continued from page X":
+→ this is the SAME citation — merge ALL text, ignore page boundaries.
+NEVER stop extraction at page breaks.
 
-Return JSON: { "tag_number": "", "scope_severity": "", "regulatory_title": "", "cfr_citations": [], "federal_requirement_text": "", "deficiency_narrative_full": "VERBATIM TEXT", "deficiency_summary": "VERBATIM first sentence of narrative", "harm_or_risk_statement": "", "observation_evidence": "", "interview_evidence": "", "record_review_evidence": "", "staff_statements": [], "state_regulatory_references": [], "direct_quotes": [], "affected_residents": [] }
+==================================================
+POC EXCLUSION RULE (MANDATORY)
+==================================================
 
-Return ONLY valid JSON. No markdown. No preamble.`;
+Extract ONLY deficiency text. DO NOT include Plan of Correction text.
+Stop extraction BEFORE any of these appear:
+- A. CORRECTIVE ACTION
+- B. RESIDENTS AFFECTED
+- C. SYSTEMIC CHANGES
+- D. MONITORING
+- EDUCATION/TRAINING
+- corrective action language
+- facility response language
+
+==================================================
+WHAT YOU MUST CAPTURE (VERBATIM)
+==================================================
+
+For each F-tag include EVERYTHING:
+- F-tag line, SS = severity, regulatory title
+- CFR(s)
+- ALL federal regulation text before "This REQUIREMENT is NOT MET as evidenced by:"
+- The phrase "This REQUIREMENT is NOT MET as evidenced by:"
+- ALL narrative: Based on…, The facility failed to…, sample/scope, risk statements,
+  Findings included…, ALL resident-level findings, ALL interviews, ALL observations,
+  ALL record reviews, ALL staff statements, ALL administrator statements, ALL state references
+END immediately BEFORE the next F-tag.
+
+EXCLUDE ONLY: headers, footers, facility address blocks, column labels, signature sections.
+F0000 Initial Comments: capture verbatim but store separately, NOT as a citation.
+FAILSAFE: If unsure → INCLUDE text.
+
+==================================================
+OUTPUT FORMAT
+==================================================
+
+Return ONLY valid JSON — no markdown, no preamble:
+
+{
+  "initial_comments": { "tag_number": "F0000", "full_text": "VERBATIM TEXT" },
+  "citations": [
+    {
+      "tag_number": "F####",
+      "full_deficiency_text": "FULL VERBATIM DEFICIENCY TEXT",
+      "scope_severity": "",
+      "regulatory_title": "",
+      "cfr_citations": [],
+      "federal_requirement_text": "",
+      "deficiency_narrative_full": "",
+      "harm_or_risk_statement": "",
+      "observation_evidence": "",
+      "interview_evidence": "",
+      "record_review_evidence": "",
+      "staff_statements": [],
+      "state_regulatory_references": [],
+      "affected_residents": []
+    }
+  ]
+}
+
+FINAL PRINCIPLE: CMS-2567 DEFICIENCY = EVERYTHING BETWEEN F-TAGS (EXCLUDING POC).
+VERBATIM TEXT IS SOURCE OF TRUTH.`;
 
     const aiExtractor = async ({ tag_number, raw_block, fallback }) => {
       const header = raw_block.slice(0, 800);
@@ -851,13 +925,18 @@ Return ONLY valid JSON. No markdown. No preamble.`;
         ? raw_block.slice(narrativeStart, narrativeStart + 4000)
         : raw_block.slice(Math.floor(raw_block.length * 0.3), Math.floor(raw_block.length * 0.3) + 4000);
 
-      const prompt = "Extract tag " + tag_number + " from this CMS-2567 block. Capture ALL text VERBATIM — do not summarize, rephrase, or shorten.\n\n" +
-        "=== CITATION BLOCK ===\n" + header + "\n\n" + narrative +
-        "\n\nReturn a JSON object with these fields (deficiency_narrative_full MUST be verbatim): " +
-        "{tag_number,scope_severity,scope_severity_raw,regulatory_title,cfr_citations,federal_requirement_text," +
-        "deficiency_summary,deficiency_narrative_full,harm_or_risk_statement,observation_evidence," +
-        "interview_evidence,record_review_evidence,affected_residents,staff_statements," +
-        "state_regulatory_references,direct_quotes}. Return ONLY the JSON object.";
+      // Send full raw block — no slicing, no truncation
+      // The spec requires EVERYTHING between F-tags verbatim
+      const prompt = "Extract tag " + tag_number + " from this CMS-2567 block.\n\n" +
+        "RULE: Capture ALL text VERBATIM. Do not summarize, rephrase, shorten, or skip any content.\n" +
+        "RULE: Include everything from the F-tag line through the last line before the next F-tag.\n" +
+        "RULE: full_deficiency_text must contain the COMPLETE verbatim block.\n\n" +
+        "=== FULL CITATION BLOCK ===\n" + raw_block +
+        "\n\nReturn a JSON object: {tag_number, full_deficiency_text (VERBATIM COMPLETE BLOCK), " +
+        "scope_severity, regulatory_title, cfr_citations, federal_requirement_text, " +
+        "deficiency_narrative_full, harm_or_risk_statement, observation_evidence, " +
+        "interview_evidence, record_review_evidence, staff_statements, " +
+        "state_regulatory_references, affected_residents}. Return ONLY valid JSON.";
 
       // Attempt 1
       let result = null;
