@@ -57,7 +57,7 @@ async function generatePOCOnServer(citation, facility, guidance, includeDates) {
 TAG: ${citation.tags?.join(", ")} | Survey Date: ${citation.survey_date} | Scope/Severity: ${citation.scope_severity}
 ${citation.title ? "REGULATION: " + citation.title : ""}
 ${citation.cfr_citation ? "CFR: " + citation.cfr_citation : ""}
-${citation.initial_comments ? "SURVEY CONTEXT (Initial Comments): " + citation.initial_comments.slice(0, 500) : ""}
+${citation.initial_comments ? "SURVEY CONTEXT (Initial Comments): " + citation.initial_comments : ""}
 
 VERBATIM DEFICIENCY TEXT FROM CMS-2567 (do not quote or repeat this in the POC — respond to it):
 ${deficiencyContext}
@@ -901,32 +901,9 @@ FINAL PRINCIPLE: CMS-2567 DEFICIENCY = EVERYTHING BETWEEN F-TAGS (EXCLUDING POC)
 VERBATIM TEXT IS SOURCE OF TRUTH.`;
 
     const aiExtractor = async ({ tag_number, raw_block, fallback }) => {
-      const header = raw_block.slice(0, 800);
-      // Fuzzy narrative start detection
-      const narrativeMarkers = [
-        "NOT MET as evidenced by:",
-        "NOT MET as evidenced by",
-        "is not met as evidenced",
-        "Based on observation, interview, and record review",
-        "Based on record review, observation",
-        "Based on observation and interview",
-        "Based on interview and record review",
-        "Based on record review and interview",
-        "Based on observation",
-        "Based on interview",
-        "Based on record review",
-      ];
-      let narrativeStart = -1;
-      for (const m of narrativeMarkers) {
-        const idx = raw_block.toLowerCase().indexOf(m.toLowerCase());
-        if (idx !== -1) { narrativeStart = idx; break; }
-      }
-      const narrative = narrativeStart !== -1
-        ? raw_block.slice(narrativeStart, narrativeStart + 4000)
-        : raw_block.slice(Math.floor(raw_block.length * 0.3), Math.floor(raw_block.length * 0.3) + 4000);
-
-      // Send full raw block — no slicing, no truncation
-      // The spec requires EVERYTHING between F-tags verbatim
+      // Send the complete raw block — no header/narrative splitting, no truncation
+      // The CMS-2567 spec requires EVERYTHING between F-tags verbatim
+      // raw_block is already the merged, continuation-page-joined full block
       const prompt = "Extract tag " + tag_number + " from this CMS-2567 block.\n\n" +
         "RULE: Capture ALL text VERBATIM. Do not summarize, rephrase, shorten, or skip any content.\n" +
         "RULE: Include everything from the F-tag line through the last line before the next F-tag.\n" +
@@ -1047,18 +1024,54 @@ VERBATIM TEXT IS SOURCE OF TRUTH.`;
       approvedCount + " approved | " + humanReviewCount + " need review | " + hardFailCount + " hard fails");
     console.log("[Parse " + jobId + "] Instrumentation:", JSON.stringify(instrumentation));
 
-    // Extract facility/survey metadata from document header (first 2000 chars)
+    // Extract facility/survey metadata from document header
     let facilityName2 = facilityName || "";
     let surveyDate2 = null;
     let surveyType2 = null;
+    let surveyMetadata = {};
     try {
-      const hText = docText.slice(0, 2000);
-      // Survey date — look for MM/DD/YYYY near "DATE SURVEY COMPLETED"
+      const hText = docText.slice(0, 3000);
+
+      // Survey date
       const dateMatch = hText.match(/DATE SURVEY COMPLETED[\s\S]{0,100}?(\d{2}\/\d{2}\/\d{4})/i);
       if (dateMatch) {
         const [m, d, y] = dateMatch[1].split("/");
         surveyDate2 = y + "-" + m + "-" + d;
       }
+
+      // Provider/CCN number — appears after "IDENTIFICATION NUMBER:" label
+      const ccnMatch = hText.match(/IDENTIFICATION NUMBER[\s\S]{0,50?}?(\d{5,10})/i);
+      const providerNumber = ccnMatch ? ccnMatch[1].trim() : (() => {
+        // Fallback: find a standalone 5-6 digit number near the header
+        const m = hText.match(/(\d{5,6})/);
+        return m ? m[1] : "";
+      })();
+
+      // Event ID and Facility ID — appear in page footer
+      const fullText3000 = docText.slice(0, 3000);
+      const eventMatch = fullText3000.match(/Event ID:\s*([A-Z0-9\-]+)/i);
+      const eventId = eventMatch ? eventMatch[1].trim() : "";
+      const facilIdMatch = fullText3000.match(/Facility ID:\s*([A-Z0-9\-]+)/i);
+      const facilityIdDoc = facilIdMatch ? facilIdMatch[1].trim() : "";
+
+      // Facility address - line after STREET ADDRESS label
+      let facilityAddress = "";
+      const hLines = hText.split("\n");
+      for (let li = 0; li < hLines.length; li++) {
+        if (/STREET ADDRESS/i.test(hLines[li])) {
+          const next = (hLines[li+1]||"").trim();
+          if (next.length >= 5) { facilityAddress = next; break; }
+        }
+      }
+
+      // Total pages from footer
+      const pagesMatch = fullText3000.match(/Page\s+\d+\s+of\s+(\d+)/i);
+      const totalPages = pagesMatch ? parseInt(pagesMatch[1]) : null;
+
+      // Printed date
+      const printedMatch = hText.match(/PRINTED:\s*(\d{2}\/\d{2}\/\d{4})/i);
+      const printedDate = printedMatch ? printedMatch[1] : "";
+
       // Facility name
       const nameLines = hText.split("\n");
       for (let li = 0; li < nameLines.length; li++) {
@@ -1067,7 +1080,18 @@ VERBATIM TEXT IS SOURCE OF TRUTH.`;
           if (nextLine.length >= 3) { facilityName2 = nextLine; break; }
         }
       }
-    } catch(e) {}
+
+      surveyMetadata = {
+        provider_name: facilityName2,
+        provider_number: providerNumber,
+        facility_id: facilityIdDoc,
+        event_id: eventId,
+        survey_completed_date: dateMatch ? dateMatch[1] : "",
+        facility_address: facilityAddress,
+        total_pages: totalPages,
+        printed_date: printedDate,
+      };
+    } catch(e) { console.warn("[Parse] Header extraction error:", e.message); }
 
     job.status = "complete";
     // Contingency 9: suggest vision fallback if many stubs or hard fails
@@ -1079,6 +1103,7 @@ VERBATIM TEXT IS SOURCE OF TRUTH.`;
       survey_date: surveyDate2,
       survey_type: surveyType2,
       initial_comments: parseResult.initial_comments || "",
+      survey_metadata: surveyMetadata,
       citations: deduped,
       validation_summary: {
         total: deduped.length,
