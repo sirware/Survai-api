@@ -522,43 +522,34 @@ function validateAndScoreCitation(citation) {
   const softErrors = [];
   const tag = (citation.tag_number || citation.tag || "").trim();
 
-  // ── HARD fail rules — only truly fatal issues ────────────────────────────
-  // Per architecture guidance: never let strict validation hide citations.
-  // Visible ≠ approved. Keep the citation visible, flag it for review.
+  // ── HARD fail rules — ONLY: missing tag OR completely empty block ─────────
+  // Per spec: REMOVE hard fails for missing regulatory_title, CFR, scope_severity,
+  // structured fields. Only hard fail if no tag or block is clearly empty.
   if (tag === "F0000") hardErrors.push("F0000 must not appear as a deficiency citation");
   if (!/^[FKE]\d{3,4}$/.test(tag)) hardErrors.push("Invalid tag_number: " + tag);
-  const ps = citation.page_start, pe = citation.page_end;
-  if (ps !== null && pe !== null && typeof ps === "number" && typeof pe === "number" && ps > pe) hardErrors.push("page_start > page_end");
 
-  // Only hard-fail on empty narrative if the block is truly empty (not just short)
-  const narrative = (citation.deficiency_narrative_full || citation.deficiency_statement || "").trim();
-  if (!narrative) hardErrors.push(tag + ": completely empty narrative");
-  else if (narrative.length < 40) hardErrors.push(tag + ": narrative too short to be a real citation");
+  // Only hard fail if both verbatim text AND narrative are completely empty
+  const fullText = (citation.full_deficiency_text || "").trim();
+  const narrative = (citation.deficiency_narrative_full || citation.deficiency_statement || citation.deficiency_summary || "").trim();
+  if (!fullText && !narrative) hardErrors.push(tag + ": citation block is empty");
+  else if (!fullText && narrative.length < 20) hardErrors.push(tag + ": citation block too short to be real");
 
-  // Auto-strip boilerplate from narrative fields — do not hard-fail, just clean
+  // Auto-strip boilerplate from narrative fields — soft flag, never hard fail
   const narrativeFields = ["deficiency_narrative_full","deficiency_summary","findings_full","observation_evidence","interview_evidence","record_review_evidence"];
   for (const field of narrativeFields) {
     if (containsBoilerplate(citation[field] || "")) {
-      // Strip and flag for review — do not hard-fail
       citation[field] = stripBoilerplateFromField(citation[field]);
       softErrors.push(tag + ": boilerplate auto-stripped from " + field);
     }
   }
 
-  // ── SOFT fail rules — flag for human review but keep the citation ─────────
-  // These were previously hard errors — now demoted per architecture guidance
-  if (!citation.regulatory_title?.trim()) softErrors.push(tag + ": missing regulatory_title");
+  // ── SOFT flags — everything else goes to needs_review, never rejected ─────
   if (!citation.scope_severity?.trim()) softErrors.push(tag + ": missing scope_severity");
+  if (!citation.regulatory_title?.trim()) softErrors.push(tag + ": missing regulatory_title");
   if (!citation.cfr_citations?.length) softErrors.push(tag + ": missing CFR citations");
-  if (ps === null || pe === null) softErrors.push(tag + ": missing page range");
   if ((citation.deficiency_summary || "").trim().length < 20) softErrors.push(tag + ": deficiency_summary short");
-  if (/Continued from page/i.test(citation.deficiency_narrative_full || "")) softErrors.push(tag + ": continuation marker in narrative");
-  const hasQuote = /"/.test(citation.deficiency_narrative_full || "") || /\u201c/.test(citation.deficiency_narrative_full || "");
-  if (hasQuote && !(citation.direct_quotes?.length)) softErrors.push(tag + ": quotes in text but direct_quotes empty");
-  const evidenceAllBlank = !citation.observation_evidence && !citation.interview_evidence && !citation.record_review_evidence;
-  if (evidenceAllBlank && (citation.affected_residents?.length || 0) > 0) softErrors.push(tag + ": residents cited but evidence fields empty");
   const statePattern = /WAC\s+\d|RCW\s+\d|CMR\s+\d|\d{1,3}\s+ILCS/i;
-  if (statePattern.test(citation.deficiency_narrative_full || "") && !(citation.state_regulatory_references?.length)) softErrors.push(tag + ": state reference detected but not extracted");
+  if (statePattern.test(narrative) && !(citation.state_regulatory_references?.length)) softErrors.push(tag + ": state reference not extracted");
 
   // Confidence scoring
   let noiseScore = 0;
@@ -611,7 +602,7 @@ function normalizeCitation(citation, surveyUid) {
     if (!Array.isArray(citation[f])) citation[f] = [];
   }
   // Ensure required strings
-  for (const f of ["scope_severity","scope_severity_raw","regulatory_title","federal_requirement_text","deficiency_narrative_full","deficiency_summary","sample_scope_text","harm_or_risk_statement","findings_full","observation_evidence","interview_evidence","record_review_evidence","deficiency_category","department_owner"]) {
+  for (const f of ["scope_severity","scope_severity_raw","regulatory_title","federal_requirement_text","full_deficiency_text","deficiency_narrative_full","deficiency_summary","sample_scope_text","harm_or_risk_statement","findings_full","observation_evidence","interview_evidence","record_review_evidence","deficiency_category","department_owner"]) {
     if (typeof citation[f] !== "string") citation[f] = "";
   }
   // Ensure poc_inputs
@@ -790,13 +781,39 @@ async function runParseJob(jobId, pdfBase64, facilityName) {
 
 
     // Build the AI enrichment function — called per citation by parseCMS2567
-    // Extraction system prompt — separate from POC generation prompt
-    // CRITICAL: extraction must preserve surveyor text verbatim — it is a legal record
-    const extractionSystemPrompt = `You are a CMS-2567 data extraction engine. Extract structured fields from surveyor-written deficiency citations.
+    // Verbatim extraction prompt — per CMS-2567 legal compliance spec
+    const extractionSystemPrompt = `You are extracting Statements of Deficiencies from a CMS-2567.
 
-CRITICAL LEGAL RULE: The deficiency_narrative_full and deficiency_summary fields must contain the surveyor's EXACT words. Do not paraphrase, summarize, abbreviate, or rephrase. Copy the text verbatim. The CMS-2567 is a legal document — altering the surveyor's language misrepresents the citation and can invalidate the Plan of Correction.
+CRITICAL REQUIREMENT: You must capture ALL deficiency text VERBATIM.
+Do NOT summarize, paraphrase, shorten, or modify any wording.
 
-Only exclude: page headers, footers, column labels, continuation markers, and form boilerplate. Preserve all substantive deficiency text exactly as written.`;
+CORE RULE — F-TAG BLOCK EXTRACTION:
+Each F-tag (F####) represents ONE deficiency citation.
+A citation starts at an F-tag, continues across pages if needed, ends ONLY when a DIFFERENT F-tag begins.
+
+WHAT YOU MUST CAPTURE (VERBATIM) for each F-tag:
+- scope/severity (SS = D, etc.)
+- regulatory title
+- CFR citation(s)
+- ALL federal requirement text
+- the phrase: "This REQUIREMENT is NOT MET as evidenced by:"
+- the FULL deficiency narrative including: Based on…, The facility failed to…, sample/scope, risk statement, Findings included…, ALL resident-level details, ALL interviews, ALL observations, ALL record reviews, ALL staff statements, ALL state references
+
+VERBATIM RULES (MANDATORY):
+- DO NOT rewrite text
+- DO NOT clean grammar
+- DO NOT summarize
+- DO NOT remove repetition
+- DO NOT shorten content
+Return EXACT TEXT as it appears in the document.
+
+EXCLUDE ONLY: page headers, page footers, facility address blocks, column labels, signature sections, F0000 Initial Comments.
+
+FAILSAFE: If unsure whether text belongs → INCLUDE it.
+
+Return JSON: { "tag_number": "", "scope_severity": "", "regulatory_title": "", "cfr_citations": [], "federal_requirement_text": "", "deficiency_narrative_full": "VERBATIM TEXT", "deficiency_summary": "VERBATIM first sentence of narrative", "harm_or_risk_statement": "", "observation_evidence": "", "interview_evidence": "", "record_review_evidence": "", "staff_statements": [], "state_regulatory_references": [], "direct_quotes": [], "affected_residents": [] }
+
+Return ONLY valid JSON. No markdown. No preamble.`;
 
     const aiExtractor = async ({ tag_number, raw_block, fallback }) => {
       const header = raw_block.slice(0, 800);
@@ -823,15 +840,13 @@ Only exclude: page headers, footers, column labels, continuation markers, and fo
         ? raw_block.slice(narrativeStart, narrativeStart + 4000)
         : raw_block.slice(Math.floor(raw_block.length * 0.3), Math.floor(raw_block.length * 0.3) + 4000);
 
-      const prompt = "Extract deficiency citation for tag " + tag_number + " from this CMS-2567 block.\n\n" +
-        "=== HEADER (tag, SS, CFR, title) ===\n" + header +
-        "\n\n=== DEFICIENCY NARRATIVE ===\n" + narrative +
-        "\n\nReturn a JSON array with exactly 1 object: " +
+      const prompt = "Extract tag " + tag_number + " from this CMS-2567 block. Capture ALL text VERBATIM — do not summarize, rephrase, or shorten.\n\n" +
+        "=== CITATION BLOCK ===\n" + header + "\n\n" + narrative +
+        "\n\nReturn a JSON object with these fields (deficiency_narrative_full MUST be verbatim): " +
         "{tag_number,scope_severity,scope_severity_raw,regulatory_title,cfr_citations,federal_requirement_text," +
         "deficiency_summary,deficiency_narrative_full,harm_or_risk_statement,observation_evidence," +
         "interview_evidence,record_review_evidence,affected_residents,staff_statements," +
-        "state_regulatory_references,direct_quotes,deficiency_category,department_owner,poc_inputs}. " +
-        "Return ONLY the JSON array.";
+        "state_regulatory_references,direct_quotes}. Return ONLY the JSON object.";
 
       // Attempt 1
       let result = null;
