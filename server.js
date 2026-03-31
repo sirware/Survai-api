@@ -95,19 +95,6 @@ async function runBatchJob(batchId, citations, facility, settings, userId, facil
     let pipData = null;
     let lastError = null;
 
-    // POC Gatekeeper — block generation for hard fails or very noisy citations
-    const gate = canGeneratePOC(citation);
-    if (!gate.allowed) {
-      console.warn("[Batch " + batchId + "] Skipping " + (citation.tags?.[0] || "?") + " — " + gate.reason);
-      job.failed++;
-      job.errors.push((citation.tags?.[0] || "?") + ": blocked — " + gate.reason);
-      job.current = job.done + job.failed;
-      return;
-    }
-    if (gate.flagged) {
-      console.log("[Batch " + batchId + "] " + (citation.tags?.[0] || "?") + " flagged (needs review) but proceeding");
-    }
-
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         const guidance = "";
@@ -635,40 +622,6 @@ function normalizeCitation(citation, surveyUid) {
   citation.page_start = citation.page_start || null;
   citation.page_end = citation.page_end || null;
   return citation;
-}
-
-// ─── POC Gatekeeper ──────────────────────────────────────────────────────────
-// A citation must pass all of these before server-side POC generation runs.
-// Prevents bad downstream outputs from noisy or incomplete extractions.
-
-function canGeneratePOC(citation) {
-  if (!citation) return { allowed: false, reason: "No citation object" };
-
-  // Hard block: explicit hard_fail from validator (only when scores are actually set)
-  if (citation.validation_status === "hard_fail" && citation.noise_score !== undefined) {
-    return { allowed: false, reason: "Hard validation failure: " + (citation.hard_errors || []).join("; ") };
-  }
-
-  // Hard block: noise/confidence scores only apply when they were actually computed
-  // User-confirmed citations won't have these fields — don't block them
-  if (citation.noise_score !== undefined && citation.noise_score > 0.5) {
-    return { allowed: false, reason: "Noise score too high: " + citation.noise_score };
-  }
-  if (citation.boundary_confidence !== undefined && citation.boundary_confidence < 0.3) {
-    return { allowed: false, reason: "Boundary confidence too low: " + citation.boundary_confidence };
-  }
-
-  // Hard block: no tag at all
-  if (!citation.tags?.length && !citation.tag && !citation.tag_number) {
-    return { allowed: false, reason: "No tag — cannot generate POC" };
-  }
-
-  // Soft flag: needs review but still allowed through
-  if (citation.requires_human_review || citation.validation_status === "needs_human_review") {
-    return { allowed: true, flagged: true, reason: "Needs human review" };
-  }
-
-  return { allowed: true, flagged: false, reason: null };
 }
 
 // ─── PDF Parse — server-side extraction, column-aware ────────────────────────
