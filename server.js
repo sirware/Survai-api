@@ -33,6 +33,13 @@ const supabase = createClient(
 const batchJobs = new Map();
 
 // ─── POC Generation Helper ────────────────────────────────────────────────────
+// Default signers — always saved so the signature panel renders correctly
+const DEFAULT_SIGNERS = [
+  { id: "administrator", role: "Administrator", credential: "NHA", name: "", date: "", signatureData: null, signedAt: null, status: "pending", method: null, required: true },
+  { id: "don", role: "Director of Nursing", credential: "RN, DON", name: "", date: "", signatureData: null, signedAt: null, status: "pending", method: null, required: false },
+  { id: "medical_director", role: "Medical Director", credential: "MD", name: "", date: "", signatureData: null, signedAt: null, status: "pending", method: null, required: false },
+];
+
 async function generatePOCOnServer(citation, facility, guidance, includeDates) {
   const systemPrompt = `You are a healthcare compliance specialist. Generate a complete Plan of Correction for a CMS deficiency citation. Return ONLY valid JSON, no markdown. Format: {"statement_of_deficiency":"","root_cause_analysis":"","immediate_corrective_actions":"","residents_affected":"","systemic_changes":"","education_and_training":"","policy_procedure_review":"","monitoring_and_auditing":"","sustainability_plan":"","projected_compliance_date":"","attestation":""}`;
 
@@ -147,7 +154,7 @@ async function runBatchJob(batchId, citations, facility, settings, userId, facil
           batch_label: batchLabel,
           sections: newPip.sections,
           citation_data: newPip.citation_data,
-          signers: [],
+          signers: DEFAULT_SIGNERS,
           guidance_used: [],
           export_history: [],
           version_history: [],
