@@ -57,6 +57,7 @@ async function generatePOCOnServer(citation, facility, guidance, includeDates) {
 TAG: ${citation.tags?.join(", ")} | Survey Date: ${citation.survey_date} | Scope/Severity: ${citation.scope_severity}
 ${citation.title ? "REGULATION: " + citation.title : ""}
 ${citation.cfr_citation ? "CFR: " + citation.cfr_citation : ""}
+${citation.initial_comments ? "SURVEY CONTEXT (Initial Comments): " + citation.initial_comments.slice(0, 500) : ""}
 
 VERBATIM DEFICIENCY TEXT FROM CMS-2567 (do not quote or repeat this in the POC — respond to it):
 ${deficiencyContext}
@@ -998,6 +999,7 @@ Return ONLY valid JSON. No markdown. No preamble.`;
       facility_name: facilityName2,
       survey_date: surveyDate2,
       survey_type: surveyType2,
+      initial_comments: parseResult.initial_comments || "",
       citations: deduped,
       validation_summary: {
         total: deduped.length,
