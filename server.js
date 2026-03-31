@@ -22,6 +22,7 @@ const BEDROCK_MODEL_ID = "us.anthropic.claude-sonnet-4-5-20250929-v1:0";
 // ─── Supabase Client ──────────────────────────────────────────────────────────
 const { createClient } = require("@supabase/supabase-js");
 const pdfParse = require("pdf-parse");
+const { parseCMS2567 } = require("./cms2567Parser");
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SECRET_KEY  // service role — bypasses RLS for server writes
@@ -813,430 +814,21 @@ async function runParseJob(jobId, pdfBase64, facilityName) {
     // ══════════════════════════════════════════════════════════════════════════
 
     // LINE-BY-LINE pre-clean pass — exact match patterns from CMS-2567 spec
-    // ── SAFE pre-strip patterns only — never strip citation structure ──────────
-    // Do NOT strip: F-tags, SS=, regulatory titles, CFR lines,
-    // "Continued from page" (needed for segmentation stitching),
-    // or anything that could be part of a citation block.
-    const LINE_EXCLUSION_PATTERNS = [
-      /^PRINTED:\s*$/i,
-      /^DEPARTMENT OF HEALTH AND HUMAN SERVICES\s*$/i,
-      /^CENTERS FOR MEDICARE (AND|&) MEDICAID SERVICES\s*$/i,
-      /^FORM APPROVED\s*$/i,
-      /^OMB\s*N[O0]\..*$/i,
-      /^STATEMENT OF DEFICIENCIES\s*$/i,
-      /^AND PLAN OF CORRECTIONS?\s*$/i,
-      /^FORM\s+CMS[-\s]?2567.*$/i,
-      /^If continuation sheet Page\s+\d+\s+of\s+\d+\s*$/i,
-      /^STATE REPRESENTATIVE SIGNATURE\s*$/i,
-      /^SURVEYOR SIGNATURE\s*$/i,
-      /^TITLE\s+DATE\s+TIME\s*$/i,
-      /^\d+$/, // standalone page numbers only
-    ];
-
-    // INLINE patterns — only truly safe global replacements
-    const INLINE_EXCLUSION_PATTERNS = [
-      /DEPARTMENT OF HEALTH AND HUMAN SERVICES/gi,
-      /CENTERS FOR MEDICARE (AND|&) MEDICAID SERVICES/gi,
-      /FORM\s+CMS[-\s]?2567[^\n]*/gi,
-      /Previous Versions? Obsolete[^\n]*/gi,
-      /OMB\s*N[O0]\.?\s*0938-0391/gi,
-      /FORM APPROVED/gi,
-    ];
-    // NOTE: "Continued from page X" is NOT stripped here — segmentation uses it
-    // to know a citation is continuing. Strip it AFTER blocks are formed.
-
-    // F0000 block — remove everything from F0000 up to the first real citation tag
-    const f0000Match = docText.match(/\bF0*000\b[\s\S]*?(?=\bF0*[1-9]\d{2,3}\b)/);
-    let workDoc = f0000Match ? docText.slice(f0000Match.index + f0000Match[0].length) : docText;
-
-    // Apply inline patterns first
-    for (const p of INLINE_EXCLUSION_PATTERNS) {
-      workDoc = workDoc.replace(p, " ");
-    }
-
-    // Apply line-level patterns
-    let cleanedText = workDoc
-      .split("\n")
-      .filter(line => {
-        const t = line.trim();
-        if (!t) return false;
-        // Test each line-exclusion pattern
-        for (const p of LINE_EXCLUSION_PATTERNS) {
-          if (p.test(t)) return false;
-        }
-        // Discard short all-caps lines that are clearly column labels or metadata
-        // PRESERVE: lines with F-tags, SS=, CFR, 483, WAC/RCW, §, or regulatory terms
-        if (
-          t === t.toUpperCase() &&
-          t.length < 60 &&
-          t.split(/\s+/).length <= 6 &&
-          !/\b[FKE]\d{3,4}\b/.test(t) &&
-          !/SS\s*=/.test(t) &&
-          !/CFR|483\./.test(t) &&
-          !/WAC|RCW|CMR/.test(t) &&
-          !/§/.test(t) &&
-          !/NOT MET/i.test(t)
-        ) return false;
-        return true;
-      })
-      .join("\n")
-      .replace(/\n{3,}/g, "\n\n")
-      .trim();
-
-    const removedChars = docText.length - cleanedText.length;
-    console.log("[Parse " + jobId + "] Stage 1 cleanup: " + cleanedText.length + " chars (" + removedChars + " removed)");
-
     // ══════════════════════════════════════════════════════════════════════════
-    // STAGE 2 — CITATION SEGMENTATION
-    // Find the FIRST occurrence of each unique F/K/E tag in the cleaned text.
-    // A citation starts only when a new tag appears followed by regulatory
-    // context (SS=, CFR, or regulatory title text).
+    // STAGES 1-3: deterministic parsing via cms2567Parser + optional AI enrichment
+    // cms2567Parser guarantees every tag surfaces, even if AI fails
     // ══════════════════════════════════════════════════════════════════════════
 
-    // ── Find ALL F/K/E tag occurrences ───────────────────────────────────────
-    // Collect every occurrence, then deduplicate to first occurrence per tag.
-    // We do NOT gate on proximity here — Stage 1 cleanup may have spread
-    // SS= and CFR text further than 300 chars from the tag.
-    // Contingency 6: normalize alternative tag formats before regex scan
-    // Some older forms use "F-578", "F 578", or inconsistent spacing
-    const normalizedForScan = cleanedText
-      .replace(/\b([FKE])[-\s](\d{3,4})\b/g, "$1$2")  // F-578 → F578, F 578 → F578
-      .replace(/\b([FKE])-(\d{3,4})\b/g, "$1$2");       // belt and suspenders
 
-    const tagPattern = /\b([FKE])(\d{3,4})\b/g;
-    const allTagMatches = [];
-    let m;
-    while ((m = tagPattern.exec(normalizedForScan)) !== null) {
-      const tag = m[1] + m[2];
-      if (tag === "F0000" || tag === "F000") continue;
-      allTagMatches.push({ tag, pos: m.index });
-    }
 
-    // Keep only FIRST occurrence of each tag
-    const seenTags = new Set();
-    const uniqueTagPositions = [];
-    for (const t of allTagMatches) {
-      if (seenTags.has(t.tag)) continue;
-      seenTags.add(t.tag);
-      uniqueTagPositions.push(t);
-    }
-
-    // Secondary filter: remove tags that are clearly cross-references, not citation starts.
-    // A cross-reference tag sits inside a sentence (surrounded by word chars or "per"/"see"/"under").
-    // A citation start tag sits at the beginning of a line or is preceded by whitespace only.
-    const filteredTagPositions = uniqueTagPositions.filter((t, idx) => {
-      // Always keep if it's the only tag or the first one
-      if (uniqueTagPositions.length <= 1 || idx === 0) return true;
-      // Check ~600 chars after the tag for citation markers (wider window post-cleanup)
-      const after = cleanedText.slice(t.pos, t.pos + 400); // tag header is ~3-4 lines post-cleanup
-      const hasCitationMarker =
-        /SS\s*=\s*[A-L]/i.test(after) ||
-        /42\s*CFR/i.test(after) ||
-        /483\.\d/i.test(after) ||
-        /This REQUIREMENT/i.test(after) ||
-        /NOT MET/i.test(after) ||
-        /deficien/i.test(after.slice(0, 200));
-      // Check 50 chars BEFORE — cross-refs are preceded by "per", "see", "under", "F-tag", etc.
-      const before = cleanedText.slice(Math.max(0, t.pos - 50), t.pos);
-      const likelyCrossRef =
-        /\b(per|see|under|reference|tag|per F|at F|to F|with F|from F)\s*$/i.test(before.trim());
-      if (likelyCrossRef && !hasCitationMarker) return false;
-      // If no citation marker found at all, still keep it — better to include than miss a citation
-      return true;
-    });
-
-    const workingText = cleanedText;
-
-    const instrumentation = {
-      raw_text_length: docText.length,
-      cleaned_text_length: cleanedText.length,
-      candidate_tag_count: filteredTagPositions.length,
-      candidate_tags: filteredTagPositions.map(t => t.tag),
-      llm_extracted_count: 0,
-      validated_count: 0,
-      rejected_count: 0,
-      rejection_reasons: []
-    };
-    job.instrumentation = instrumentation;
-
-    console.log("[Parse " + jobId + "] Instrumentation: raw=" + docText.length +
-      " cleaned=" + cleanedText.length +
-      " all_tags=" + allTagMatches.length +
-      " unique=" + uniqueTagPositions.length +
-      " candidates=" + filteredTagPositions.length +
-      " (" + filteredTagPositions.map(t => t.tag).join(", ") + ")");
-    job.totalChunks = filteredTagPositions.length;
-
-    if (filteredTagPositions.length === 0) {
-      // Fallback: if filtering removed everything, use all unique positions
-      // Better to over-include than return zero citations
-      console.warn("[Parse " + jobId + "] Cross-ref filter removed all tags — falling back to all unique positions");
-      filteredTagPositions.push(...uniqueTagPositions);
-    }
-
-    if (filteredTagPositions.length === 0) {
-      // Last resort: return raw candidate blocks so user sees something
-      // Better than "0 citations" when the document clearly has content
-      console.warn("[Parse " + jobId + "] No tags found — returning empty result");
-      job.status = "complete";
-      job.result = {
-        facility_name: facilityName, survey_date: null, survey_type: null, citations: [],
-        instrumentation, candidate_fallback: true
-      };
-      return;
-    }
-
-    // ── Step 3: Slice document into per-citation blocks ───────────────────────
-    // Each block = everything from this tag's position to the next tag's position
-    // "Continued from page X" text stays inside the same block — not a new citation
-    // ══════════════════════════════════════════════════════════════════════════
-    // STAGE 3 — STRUCTURED EXTRACTION (per citation block)
-    // Slice cleaned text by citation boundaries, then send to AI for
-    // structured field extraction.
-    // ══════════════════════════════════════════════════════════════════════════
-
-    const tagBlocks = filteredTagPositions.map((t, i) => {
-      const end = i + 1 < filteredTagPositions.length
-        ? filteredTagPositions[i + 1].pos
-        : workingText.length;
-      // Slice from cleaned text — already stripped of boilerplate
-      // Strip "Continued from page X" INSIDE the block — after boundary is established
-      const blockText = workingText.slice(t.pos, end)
-        .replace(/Continued from page\s+\d+/gi, " ")
-        .replace(/\n{3,}/g, "\n\n")
-        .trim();
-      return { tag: t.tag, text: blockText };
-    });
-
-    // ── Step 4: Extract header info ───────────────────────────────────────────
-    let facilityName2 = facilityName, surveyDate2 = null, surveyType2 = null;
-    try {
-      const headerText = workingText.slice(0, 3000);
-      const hCmd = new InvokeModelCommand({
-        modelId: BEDROCK_MODEL_ID,
-        contentType: "application/json",
-        accept: "application/json",
-        body: JSON.stringify({
-          anthropic_version: "bedrock-2023-05-31",
-          max_tokens: 300,
-          messages: [{ role: "user", content:
-            "Extract the facility name, survey completion date (YYYY-MM-DD), and survey type from this CMS-2567 header. " +
-            "Return ONLY valid JSON with keys: facility_name, survey_date, survey_type.\n\n" + headerText
-          }]
-        }),
-      });
-      const hResp = await client.send(hCmd);
-      const hData = JSON.parse(new TextDecoder().decode(hResp.body));
-      const hText = hData?.content?.[0]?.text || "";
-      const hS = hText.indexOf("{"), hE = hText.lastIndexOf("}");
-      if (hS !== -1 && hE !== -1) {
-        const h = JSON.parse(hText.slice(hS, hE + 1));
-        if (h.facility_name) facilityName2 = h.facility_name;
-        if (h.survey_date) surveyDate2 = h.survey_date;
-        if (h.survey_type) surveyType2 = h.survey_type;
-      }
-    } catch(e) { console.warn("[Parse " + jobId + "] Header extract failed:", e.message); }
-
-    // ── Steps 4+5: Header + AI extraction — parallel ────────────────────────────
-    // Fire header extraction immediately — runs in parallel with citation batches
-    const headerPromise = (async () => {
-      try {
-        const headerText = workingText.slice(0, 2000);
-        const hCmd = new InvokeModelCommand({
-          modelId: BEDROCK_MODEL_ID, contentType: "application/json", accept: "application/json",
-          body: JSON.stringify({ anthropic_version: "bedrock-2023-05-31", max_tokens: 200,
-            messages: [{ role: "user", content: "From this CMS-2567 header extract facility_name, survey_date (YYYY-MM-DD), survey_type. Return ONLY valid JSON, nothing else.\n\n" + headerText }]
-          }),
-        });
-        const hResp = await client.send(hCmd);
-        const hText = JSON.parse(new TextDecoder().decode(hResp.body))?.content?.[0]?.text || "";
-        const hS = hText.indexOf("{"), hE = hText.lastIndexOf("}");
-        if (hS !== -1 && hE !== -1) {
-          const h = JSON.parse(hText.slice(hS, hE + 1));
-          if (h.facility_name) facilityName2 = h.facility_name;
-          if (h.survey_date) surveyDate2 = h.survey_date;
-          if (h.survey_type) surveyType2 = h.survey_type;
-        }
-      } catch(e) { console.warn("[Parse " + jobId + "] Header extract failed:", e.message); }
-    })();
-
-    // Process ONE tag per AI call — avoids token overflow from large regulatory blocks
-    // 4 tags run in parallel so total time is similar to batching but far more reliable
-    const BATCH_SIZE = 1;
-    const CONCURRENCY = 4;
-    const allCitations = new Array(tagBlocks.length).fill(null);
-
-    const systemPrompt = `You are a CMS-2567 extraction engine built for high-precision regulatory parsing.
-
-Your sole task is to extract true deficiency citation content from a CMS-2567 Statement of Deficiencies while aggressively excluding page furniture, repeated form text, and non-substantive boilerplate.
-
-The text you receive has already been pre-cleaned. However, some boilerplate may still remain due to PDF extraction artifacts. Apply all exclusion rules strictly.
-
-STEP 1 — CLASSIFY EVERY LINE OR BLOCK before extracting:
-1. HEADER — agency names, form titles, OMB lines → DISCARD
-2. FACILITY_METADATA — provider numbers, facility name/address blocks → DISCARD
-3. COLUMN_LABEL — ID PREFIX TAG, SUMMARY STATEMENT, PROVIDER'S PLAN, COMPLETION DATE → DISCARD
-4. CONTINUATION_MARKER — "Continued from page X" → DISCARD
-5. FOOTER — FORM CMS-2567, Event ID, Facility ID, Page X of Y → DISCARD
-6. SURVEY_METADATA — F0000 INITIAL COMMENTS → DISCARD
-7. CITATION_HEADER — F-tag + SS= + regulatory title → KEEP
-8. REGULATION_TEXT — CFR citations + federal requirement language → KEEP
-9. DEFICIENCY_NARRATIVE — findings, residents, observations, interviews → KEEP
-10. PLAN_OF_CORRECTION_TEXT — only if provider actually entered text → KEEP
-11. SIGNATURE_BLOCK → DISCARD
-
-NON-NEGOTIABLE EXCLUSIONS — never include in any output field:
-DEPARTMENT OF HEALTH AND HUMAN SERVICES | CENTERS FOR MEDICARE & MEDICAID SERVICES |
-STATEMENT OF DEFICIENCIES AND PLAN OF CORRECTIONS | FORM APPROVED | OMB NO. 0938-0391 |
-PROVIDER/SUPPLIER/CLIA IDENTIFICATION NUMBER | DATE SURVEY COMPLETED |
-NAME OF PROVIDER OR SUPPLIER | STREET ADDRESS CITY STATE ZIP | ID PREFIX TAG |
-SUMMARY STATEMENT OF DEFICIENCIES | PROVIDER'S PLAN OF CORRECTION | COMPLETION DATE |
-Continued from page X | FORM CMS-2567 | Previous Versions Obsolete |
-Event ID: | Facility ID: | If continuation sheet Page X of Y | signature lines | page numbers
-
-CITATION BOUNDARY RULES:
-- Citation STARTS: new F-tag + (SS= or CFR or regulatory title within 300 chars)
-- Citation ENDS: next different F-tag begins, or document ends
-- Same F-tag on continuation page = SAME citation, do NOT start new object
-- F0000 = survey metadata, exclude from citations array entirely
-
-REGULATION vs NARRATIVE:
-- BEFORE "This REQUIREMENT is NOT MET as evidenced by:" → federal_requirement_text
-- AFTER that phrase → deficiency_narrative_full
-
-POST-PROCESSING — before returning, verify each citation:
-1. No header/footer boilerplate in any field
-2. No "Continued from page X" text in any field
-3. No column labels in any field
-4. No repeated facility metadata in any field
-5. deficiency_narrative starts only after "This REQUIREMENT is NOT MET"
-6. F0000 excluded
-
-Return one top-level JSON object with survey_metadata and citations array.
-Enable extraction_debug with excluded_text_samples showing what was discarded.
-
-Schema:
-{
-  "survey_metadata": {"provider_name":"","provider_number":"","survey_completed_date":"","facility_address":""},
-  "citations": [{
-    "tag_number": "F####",
-    "scope_severity": "",
-    "scope_severity_raw": "",
-    "regulatory_title": "",
-    "cfr_citations": [],
-    "federal_requirement_text": "",
-    "deficiency_summary": "",
-    "deficiency_narrative_full": "",
-    "sample_scope_text": "",
-    "harm_or_risk_statement": "",
-    "observation_evidence": "",
-    "interview_evidence": "",
-    "record_review_evidence": "",
-    "affected_residents": [{"resident_id":"","citation_specific_issue":"","dates_mentioned":[],"diagnoses_or_conditions":[],"related_staff":[]}],
-    "staff_statements": [],
-    "state_regulatory_references": [],
-    "direct_quotes": [],
-    "deficiency_category": "",
-    "department_owner": "",
-    "poc_inputs": {"core_problem_statement":"","what_failed":"","who_was_affected":"","why_this_matters":"","immediate_correction_candidates":[],"systemic_issue_candidates":[],"monitoring_candidates":[],"training_candidates":[],"documentation_gaps":[]}
-  }],
-  "extraction_debug": {"excluded_text_samples":[],"possible_noise_removed":[]}
-}
-
-Return ONLY valid JSON. Nothing before { or after }.`;
-
-    // Build batch groups upfront
-    const batches = [];
-    for (let bi = 0; bi < tagBlocks.length; bi += BATCH_SIZE) {
-      batches.push({ startIdx: bi, blocks: tagBlocks.slice(bi, bi + BATCH_SIZE) });
-    }
-
-    // Process one batch
-    // ── Raw block pre-extraction ─────────────────────────────────────────────
-    // Extracts tag, SS, CFR, title, and best-effort deficiency statement
-    // from raw block text using regex — no AI needed, always works
-    // These values are used as fallback if AI extraction fails or is incomplete
-    const preExtract = (tag, text) => {
-      // SS / Scope-Severity
-      const ssMatch = text.match(/SS\s*=\s*([A-L])/i);
-      const scopeSeverity = ssMatch ? ssMatch[1].toUpperCase() : "";
-
-      // CFR citations
-      const cfrMatches = [...text.matchAll(/483\.\d+[\w().\-]*/g)];
-      const cfrCitations = [...new Set(cfrMatches.map(m => m[0]))];
-
-      // Regulatory title — line immediately after the tag on the same or next line
-      const tagLineMatch = text.match(new RegExp(tag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "[^\n]*\n([^\n]{10,80})"));
-      const rawTitleLine = tagLineMatch ? tagLineMatch[1].trim() : "";
-      // Clean it up — remove repeated tag, SS codes, and CMS boilerplate
-      const title = rawTitleLine
-        .replace(/^F\d{4}\s*/i, "")
-        .replace(/SS\s*=\s*[A-L]/i, "")
-        .replace(/CFR.*/i, "")
-        .trim()
-        .slice(0, 120);
-
-      // Best-effort deficiency statement — text after "NOT MET" or after the 30% mark
-      const narrativeStart = findNarrativeStart(text);
-      const narrativeText = text.slice(narrativeStart, narrativeStart + 600).trim();
-      // First 2 sentences of the narrative make a good deficiency statement
-      const sentences = narrativeText.match(/[^.!?]+[.!?]+/g) || [];
-      const deficiencyStatement = sentences.slice(0, 2).join(" ").trim().slice(0, 350) || narrativeText.slice(0, 250);
-
-      // Observations — look for "Based on observation" or resident mentions
-      const obsMatch = narrativeText.match(/Based on [^.]+\./i);
-      const observations = obsMatch ? obsMatch[0].trim() : "";
-
-      // Residents mentioned
-      const residentMatches = [...narrativeText.matchAll(/Resident\s+\d+/gi)];
-      const residentsAffected = [...new Set(residentMatches.map(m => m[0]))].join(", ");
-
-      return {
-        scope_severity: scopeSeverity,
-        cfr_citations: cfrCitations,
-        cfr_citation: cfrCitations.join(", "),
-        title,
-        deficiency_statement: deficiencyStatement,
-        observations,
-        residents_affected: residentsAffected,
-        _pre_extracted: true,
-      };
-    };
-
-    // ── Minimum viable citation stub (Contingency 8) ────────────────────────
-    // If all extraction attempts fail, use pre-extracted values as fallback
-    // Tag always shows, deficiency statement is best-effort from raw text
-    const STUB = (tag, blockText, reason) => {
-      const pre = preExtract(tag, blockText || "");
-      return {
-        tag, tag_number: tag,
-        scope_severity: pre.scope_severity,
-        title: pre.title,
-        cfr_citation: pre.cfr_citation,
-        cfr_citations: pre.cfr_citations,
-        deficiency_statement: pre.deficiency_statement,
-        observations: pre.observations,
-        residents_affected: pre.residents_affected,
-        deficiency_narrative_full: pre.deficiency_statement, // best effort
-        harm_or_risk_statement: "",
-        deficiency_category: "", department_owner: "",
-        affected_residents_detail: [], staff_statements: [],
-        state_regulatory_references: [], direct_quotes: [], poc_inputs: {},
-        _stub: true, _stub_reason: reason,
-        _pre_extracted: true,
-        requires_human_review: true,
-      };
-    };
-
-    // ── Contingency 1+2: Fuzzy narrative boundary detection ──────────────────
-    // Searches for multiple phrase variants that mark the start of deficiency narrative
-    // Falls back to position-based split if none found (Contingency 2)
-    const findNarrativeStart = (text) => {
-      const markers = [
+    // Build the AI enrichment function — called per citation by parseCMS2567
+    const aiExtractor = async ({ tag_number, raw_block, fallback }) => {
+      const header = raw_block.slice(0, 800);
+      // Fuzzy narrative start detection
+      const narrativeMarkers = [
         "NOT MET as evidenced by:",
         "NOT MET as evidenced by",
         "is not met as evidenced",
-        "not met based on",
         "Based on observation, interview, and record review",
         "Based on record review, observation",
         "Based on observation and interview",
@@ -1246,169 +838,82 @@ Return ONLY valid JSON. Nothing before { or after }.`;
         "Based on interview",
         "Based on record review",
       ];
-      for (const marker of markers) {
-        const idx = text.toLowerCase().indexOf(marker.toLowerCase());
-        if (idx !== -1) return idx;
+      let narrativeStart = -1;
+      for (const m of narrativeMarkers) {
+        const idx = raw_block.toLowerCase().indexOf(m.toLowerCase());
+        if (idx !== -1) { narrativeStart = idx; break; }
       }
-      // Contingency 2: position-based fallback — 30% regulatory, 70% narrative
-      return Math.floor(text.length * 0.3);
-    };
+      const narrative = narrativeStart !== -1
+        ? raw_block.slice(narrativeStart, narrativeStart + 4000)
+        : raw_block.slice(Math.floor(raw_block.length * 0.3), Math.floor(raw_block.length * 0.3) + 4000);
 
-    // ── Contingency 3+4+6: Smart block slicing ───────────────────────────────
-    const sliceBlock = (text, tag) => {
-      // Contingency 3: short blocks — send full text, no slicing needed
-      if (text.length <= 3000) return text;
+      const prompt = "Extract deficiency citation for tag " + tag_number + " from this CMS-2567 block.\n\n" +
+        "=== HEADER (tag, SS, CFR, title) ===\n" + header +
+        "\n\n=== DEFICIENCY NARRATIVE ===\n" + narrative +
+        "\n\nReturn a JSON array with exactly 1 object: " +
+        "{tag_number,scope_severity,scope_severity_raw,regulatory_title,cfr_citations,federal_requirement_text," +
+        "deficiency_summary,deficiency_narrative_full,harm_or_risk_statement,observation_evidence," +
+        "interview_evidence,record_review_evidence,affected_residents,staff_statements," +
+        "state_regulatory_references,direct_quotes,deficiency_category,department_owner,poc_inputs}. " +
+        "Return ONLY the JSON array.";
 
-      // Contingency 6: normalize alternative tag formats (F-578, F 578, K0578 etc.)
-      // These are already normalized upstream but keep header capture flexible
-
-      const header = text.slice(0, 800); // always: tag, SS=, CFR, title
-      const narrativeStart = findNarrativeStart(text);
-
-      if (narrativeStart === -1 || narrativeStart >= text.length - 100) {
-        // Contingency 2: no narrative boundary found — positional split
-        return header + "\n\n" + text.slice(Math.max(800, Math.floor(text.length * 0.3)), Math.floor(text.length * 0.3) + 4000);
-      }
-
-      const narrative = text.slice(narrativeStart, narrativeStart + 4000);
-      return header + "\n\n[...regulatory requirement text...]\n\n" + narrative;
-    };
-
-    // ── Contingency 7: Strip POC column bleed ────────────────────────────────
-    // When PDF extraction merges left+right columns, facility POC text can bleed
-    // into the deficiency narrative. Strip patterns that look like facility responses.
-    const stripPocBleed = (text) => {
-      return text
-        .replace(/PROVIDER.?S PLAN OF CORRECTION[\s\S]{0,50}cross.referenced/gi, "")
-        .replace(/Plan of Correction:[\s\S]{0,2000}/gi, "")
-        .replace(/Corrective Action[\s\S]{0,1000}(Monitor|Audit|Policy|Training)/gi, "")
-        .trim();
-    };
-
-    // ── Single Bedrock call with parsed result extraction ─────────────────────
-    const callBedrock = async (tag, promptText) => {
-      const command = new InvokeModelCommand({
-        modelId: BEDROCK_MODEL_ID, contentType: "application/json", accept: "application/json",
-        body: JSON.stringify({
-          anthropic_version: "bedrock-2023-05-31",
-          max_tokens: 8000,
-          system: systemPrompt,
-          messages: [{ role: "user", content: promptText }]
-        }),
-      });
-      const resp = await client.send(command);
-      const text = JSON.parse(new TextDecoder().decode(resp.body))?.content?.[0]?.text || "";
-      const arrStart = text.indexOf("["), arrEnd = text.lastIndexOf("]");
-      const objStart = text.indexOf("{"), objEnd = text.lastIndexOf("}");
-      if (arrStart !== -1 && arrEnd !== -1) {
-        const arr = JSON.parse(text.slice(arrStart, arrEnd + 1));
-        return arr[0] || null;
-      }
-      if (objStart !== -1 && objEnd !== -1) {
-        const o = JSON.parse(text.slice(objStart, objEnd + 1));
-        return o.citations?.[0] || o || null;
-      }
-      return null;
-    };
-
-    // ── Map AI result to canonical citation object ────────────────────────────
-    const mapResult = (tag, d) => ({
-      tag, tag_number: tag,
-      scope_severity: d.scope_severity || "",
-      title: d.regulatory_title || d.title || "",
-      cfr_citation: Array.isArray(d.cfr_citations) ? d.cfr_citations.join(", ") : (d.cfr_citation || ""),
-      deficiency_statement: d.deficiency_summary || d.deficiency_statement || "",
-      observations: [d.observation_evidence, d.interview_evidence, d.record_review_evidence].filter(Boolean).join(" | ").slice(0, 500) || "",
-      residents_affected: Array.isArray(d.affected_residents) ? d.affected_residents.map(r => r.resident_id || r).filter(Boolean).join(", ") : (d.residents_affected || ""),
-      deficiency_narrative_full: d.deficiency_narrative_full || "",
-      harm_or_risk_statement: d.harm_or_risk_statement || "",
-      deficiency_category: d.deficiency_category || "",
-      department_owner: d.department_owner || "",
-      cfr_citations: d.cfr_citations || [],
-      affected_residents_detail: d.affected_residents || [],
-      staff_statements: d.staff_statements || [],
-      state_regulatory_references: d.state_regulatory_references || [],
-      direct_quotes: d.direct_quotes || [],
-      poc_inputs: d.poc_inputs || {},
-    });
-
-    const processBatch = async ({ startIdx, blocks }) => {
-      const batchNum = Math.floor(startIdx / BATCH_SIZE) + 1;
-      job.currentChunk = Math.max(job.currentChunk || 0, batchNum);
-      const block = blocks[0];
-      const tag = block.tag;
-
-      // Contingency 7: strip POC column bleed before processing
-      const cleanedBlockText = stripPocBleed(block.text);
-
-      const makePrompt = (text) =>
-        "Extract deficiency citation for tag " + tag + " from this CMS-2567 block.\n\n" +
-        text +
-        "\n\nReturn a JSON array with exactly 1 object. Fields: {tag_number,scope_severity," +
-        "scope_severity_raw,regulatory_title,cfr_citations,federal_requirement_text,deficiency_summary," +
-        "deficiency_narrative_full,harm_or_risk_statement,observation_evidence,interview_evidence," +
-        "record_review_evidence,affected_residents,staff_statements,state_regulatory_references," +
-        "direct_quotes,deficiency_category,department_owner,poc_inputs}. Return ONLY the JSON array.";
-
-      // Always pre-extract from raw text first — provides baseline values
-      // even if AI extraction fails completely
-      const preExtracted = preExtract(tag, cleanedBlockText);
+      // Attempt 1
       let result = null;
-
-      try {
-        // Attempt 1: smart slice (header + narrative section)
-        const sliced = sliceBlock(cleanedBlockText, tag);
-        result = await callBedrock(tag, makePrompt(sliced));
-
-        // Contingency 5: retry with full block if narrative is empty
-        if (result && !result.deficiency_narrative_full?.trim() && !result.deficiency_summary?.trim()) {
-          console.log("[Parse " + jobId + "] " + tag + " — empty narrative, retrying with full block");
-          result = await callBedrock(tag, makePrompt(cleanedBlockText.slice(0, 6000)));
-        }
-      } catch(e) {
-        console.warn("[Parse " + jobId + "] " + tag + " attempt 1 failed:", e.message);
-      }
-
-      // Contingency 5: second retry if first attempt returned nothing at all
-      if (!result) {
+      for (let attempt = 0; attempt < 2; attempt++) {
         try {
-          console.log("[Parse " + jobId + "] " + tag + " — retrying with full block");
-          result = await callBedrock(tag, makePrompt(cleanedBlockText.slice(0, 6000)));
+          const command = new InvokeModelCommand({
+            modelId: BEDROCK_MODEL_ID, contentType: "application/json", accept: "application/json",
+            body: JSON.stringify({ anthropic_version: "bedrock-2023-05-31", max_tokens: 8000, system: systemPrompt, messages: [{ role: "user", content: prompt }] }),
+          });
+          const resp = await client.send(command);
+          const text = JSON.parse(new TextDecoder().decode(resp.body))?.content?.[0]?.text || "";
+          const arrStart = text.indexOf("["), arrEnd = text.lastIndexOf("]");
+          const objStart = text.indexOf("{"), objEnd = text.lastIndexOf("}");
+          if (arrStart !== -1 && arrEnd !== -1) result = JSON.parse(text.slice(arrStart, arrEnd + 1))[0];
+          else if (objStart !== -1 && objEnd !== -1) {
+            const o = JSON.parse(text.slice(objStart, objEnd + 1));
+            result = o.citations?.[0] || o;
+          }
+          if (result) break;
         } catch(e) {
-          console.warn("[Parse " + jobId + "] " + tag + " retry failed:", e.message);
+          console.warn("[Parse " + jobId + "] " + tag_number + " AI attempt " + (attempt+1) + " failed:", e.message);
+          if (attempt === 0) await new Promise(r => setTimeout(r, 1000));
         }
       }
-
-      if (result) {
-        const mapped = mapResult(tag, result);
-        // Fill any empty AI fields with pre-extracted fallback values
-        if (!mapped.scope_severity) mapped.scope_severity = preExtracted.scope_severity;
-        if (!mapped.title) mapped.title = preExtracted.title;
-        if (!mapped.cfr_citation) mapped.cfr_citation = preExtracted.cfr_citation;
-        if (!mapped.cfr_citations?.length) mapped.cfr_citations = preExtracted.cfr_citations;
-        if (!mapped.deficiency_statement) mapped.deficiency_statement = preExtracted.deficiency_statement;
-        if (!mapped.observations) mapped.observations = preExtracted.observations;
-        if (!mapped.residents_affected) mapped.residents_affected = preExtracted.residents_affected;
-        // If AI narrative is empty, use pre-extracted as fallback
-        if (!mapped.deficiency_narrative_full?.trim()) {
-          mapped.deficiency_narrative_full = preExtracted.deficiency_statement;
-          mapped._pre_extracted_fallback = true;
-        }
-        allCitations[startIdx] = mapped;
-        console.log("[Parse " + jobId + "] " + tag + " extracted (batch " + batchNum + "/" + batches.length + ")");
-      } else {
-        // Contingency 8: use pre-extracted stub — always has tag + best-effort content
-        allCitations[startIdx] = STUB(tag, cleanedBlockText, "AI extraction failed — using regex fallback");
-        console.warn("[Parse " + jobId + "] " + tag + " — AI failed, using pre-extracted stub");
-      }
+      return result;
     };
 
-    // Run all batches in parallel with concurrency limit
-    const batchQueue = [...batches];
-    const workers = Array(Math.min(CONCURRENCY, Math.max(1, batchQueue.length))).fill(null).map(async () => {
-      while (batchQueue.length > 0) { const b = batchQueue.shift(); if (b) await processBatch(b); }
+    job.status = "parsing";
+    job.totalChunks = 0; // will be updated once we know tag count
+
+    // Check for cancellation before starting extraction
+    if (job.status === "cancelled") {
+      console.log("[Parse " + jobId + "] Cancelled before extraction");
+      return;
+    }
+
+    const parseResult = await parseCMS2567(docText, {
+      aiExtractor,
+      concurrency: 4,
     });
-    await Promise.all([...workers, headerPromise]);
+
+    job.totalChunks = parseResult.stats.candidate_count;
+    job.currentChunk = parseResult.stats.candidate_count;
+
+    console.log("[Parse " + jobId + "] parseCMS2567 stats:", JSON.stringify(parseResult.stats));
+
+    const allCitations = parseResult.citations;
+    const instrumentation = {
+      raw_text_length: docText.length,
+      candidate_tag_count: parseResult.stats.candidate_count,
+      candidate_tags: allCitations.map(c => c.tag_number),
+      llm_extracted_count: parseResult.stats.ai_count,
+      fallback_count: parseResult.stats.fallback_count,
+      validated_count: 0,
+      rejected_count: 0,
+      rejection_reasons: []
+    };
+    job.instrumentation = instrumentation;
 
     // ══════════════════════════════════════════════════════════════════════════
     // STAGE 4 — VALIDATE & NORMALIZE
@@ -1521,6 +1026,15 @@ app.get("/api/parse/status/:jobId", (req, res) => {
     result: job.status === "complete" ? job.result : null,
     error: job.error || null,
   });
+});
+
+// ─── Parse Cancel ─────────────────────────────────────────────────────────────
+app.post("/api/parse/cancel/:jobId", (req, res) => {
+  const job = parseJobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: "Job not found" });
+  job.status = "cancelled";
+  console.log("[Parse " + req.params.jobId + "] Cancelled by user");
+  return res.status(200).json({ success: true });
 });
 
 // ─── Batch Generate — kick off server-side batch, return batchId immediately ──
