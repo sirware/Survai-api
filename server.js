@@ -86,6 +86,8 @@ async function runBatchJob(batchId, citations, facility, settings, userId, facil
   const job = batchJobs.get(batchId);
   if (!job) return;
 
+  const batchLabel = "Batch " + new Date().toLocaleDateString() + " — " + citations.length + " citation" + (citations.length !== 1 ? "s" : "");
+
   const CONCURRENCY = 4;
   const queue = [...citations.map((c, i) => ({ ...c, _idx: i }))];
   const results = new Array(citations.length).fill(null);
@@ -156,12 +158,16 @@ async function runBatchJob(batchId, citations, facility, settings, userId, facil
         });
         console.log(`[Batch ${batchId}] Saved POC for ${citation.tags?.join(",")}`);
       } catch (dbErr) {
-        console.warn(`[Batch ${batchId}] Supabase save failed for ${citation.tags?.join(",")}: ${dbErr.message}`);
+        console.error(`[Batch ${batchId}] Supabase save FAILED for ${citation.tags?.join(",")}: ${dbErr.message}`);
+        // Still count as done — POC was generated even if save failed
+        // Don't silently swallow — log full error
+        console.error(dbErr);
       }
 
       results[_idx] = newPip;
       job.done++;
     } else {
+      console.warn(`[Batch ${batchId}] pipData null for ${citation.tags?.join(",") || "unknown"} — lastError: ${lastError?.message}`);
       job.failed++;
       job.errors.push(`${citation.tags?.join(",")}: ${lastError?.message || "Unknown error"}`);
     }
