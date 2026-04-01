@@ -140,6 +140,8 @@ async function runBatchJob(batchId, citations, facility, settings, userId, facil
           survey_metadata: citation.survey_metadata || {},
           // Ensure verbatim fields always present
           full_deficiency_text: citation.full_deficiency_text || citation.raw_block || citation.deficiency_narrative_full || citation.deficiency_statement || "",
+          // Persist initial_comments onto every citation so it survives navigation/session
+          initial_comments: citation.initial_comments || job?.parseInitialComments || "",
         },
         batch_id: batchId,
         source_document: settings.sourceDocument || null,
@@ -1039,63 +1041,96 @@ VERBATIM TEXT IS SOURCE OF TRUTH.`;
     let surveyType2 = null;
     let surveyMetadata = {};
     try {
-      const hText = docText.slice(0, 3000);
+      // Use first 4000 chars for header extraction — covers multi-column layout
+      const hText = docText.slice(0, 4000);
+      const hLines = hText.split("\n");
 
-      // Survey date
-      const dateMatch = hText.match(/DATE SURVEY COMPLETED[\s\S]{0,100}?(\d{2}\/\d{2}\/\d{4})/i);
-      if (dateMatch) {
-        const [m, d, y] = dateMatch[1].split("/");
+      // ── Survey date — handles both MM/DD/YYYY and ISO YYYY-MM-DD ──────────
+      // Date can be 200+ chars after the label in multi-column layout
+      const dateMatchMMDD = hText.match(/DATE SURVEY COMPLETED[\s\S]{0,300}?(\d{2}\/\d{2}\/\d{4})/i);
+      const dateMatchISO  = hText.match(/DATE SURVEY COMPLETED[\s\S]{0,300}?(\d{4}-\d{2}-\d{2})/i);
+      let rawSurveyDate = "";
+      if (dateMatchMMDD) {
+        rawSurveyDate = dateMatchMMDD[1]; // MM/DD/YYYY
+        const [m,d,y] = rawSurveyDate.split("/");
         surveyDate2 = y + "-" + m + "-" + d;
+      } else if (dateMatchISO) {
+        surveyDate2 = dateMatchISO[1]; // already ISO
+        const [y,m,d] = surveyDate2.split("-");
+        rawSurveyDate = m + "/" + d + "/" + y;
       }
 
-      // Provider/CCN number — appears after "IDENTIFICATION NUMBER:" label
-      const ccnMatch = hText.match(/IDENTIFICATION NUMBER[\s\S]{0,50?}?(\d{5,10})/i);
-      const providerNumber = ccnMatch ? ccnMatch[1].trim() : (() => {
-        // Fallback: find a standalone 5-6 digit number near the header
-        const m = hText.match(/(\d{5,6})/);
-        return m ? m[1] : "";
-      })();
+      // ── CCN — appears after IDENTIFICATION NUMBER label (same line or next lines)
+      const ccnMatch = hText.match(/IDENTIFICATION NUMBER[\s\S]{0,200}?\n\s*([0-9]{5,10})\s/i)
+        || hText.match(/IDENTIFICATION NUMBER[^\n]{0,50}([0-9]{5,10})/i);
+      const providerNumber = ccnMatch ? ccnMatch[1].trim() : "";
 
-      // Event ID and Facility ID — appear in page footer
-      const fullText3000 = docText.slice(0, 3000);
-      const eventMatch = fullText3000.match(/Event ID:\s*([A-Z0-9\-]+)/i);
+      // ── Event ID and Facility ID — footer of any page ─────────────────────
+      const fullText5000 = docText.slice(0, 5000);
+      const eventMatch = fullText5000.match(/Event ID[:\s]+([A-Z0-9\-]{4,20})/i);
       const eventId = eventMatch ? eventMatch[1].trim() : "";
-      const facilIdMatch = fullText3000.match(/Facility ID:\s*([A-Z0-9\-]+)/i);
+      const facilIdMatch = fullText5000.match(/Facility ID[:\s]+([A-Z0-9\-]{4,20})/i);
       const facilityIdDoc = facilIdMatch ? facilIdMatch[1].trim() : "";
 
-      // Facility address - line after STREET ADDRESS label
+      // ── Facility name and address ─────────────────────────────────────────
+      // CMS-2567 has two layouts:
+      // Layout A (original CMS PDF): label line, then value on NEXT line
+      //   Line N:   "NAME OF PROVIDER OR SUPPLIER"
+      //   Line N+1: "BIRCH CREEK POST ACUTE & REHABILITATION"
+      //
+      // Layout B (pdftotext of printed/exported form): labels and values are
+      //   on parallel lines separated by large whitespace gaps:
+      //   Line N:   "Name of Facility Surveyed:            Facility Address (Street, City..."
+      //   Line N+1: "BIRCH CREEK POST ACUTE & REHABILITATIO    601 S ORCHARD STREET, TACOMA..."
+      //
+      // Strategy: find the label line, then look at the NEXT line and split on
+      // large whitespace to separate name (left) from address (right).
       let facilityAddress = "";
-      const hLines = hText.split("\n");
       for (let li = 0; li < hLines.length; li++) {
-        if (/STREET ADDRESS/i.test(hLines[li])) {
+        const line = hLines[li];
+        // Both layout A and B have this label somewhere
+        if (/Name of (?:Facility Surveyed|Provider or Supplier)/i.test(line)) {
+          const dataLine = (hLines[li+1] || "").trimEnd();
+          if (dataLine.trim().length >= 3) {
+            // Split on 4+ consecutive spaces — left part = name, right part = address
+            const splitM = dataLine.match(/^(.+?)\s{4,}(.+)$/);
+            if (splitM) {
+              facilityName2 = splitM[1].trim();
+              facilityAddress = splitM[2].trim();
+            } else {
+              facilityName2 = dataLine.trim();
+            }
+            break;
+          }
+        }
+        // Layout A alternate: "NAME OF PROVIDER OR SUPPLIER" label
+        if (/NAME OF PROVIDER OR SUPPLIER/i.test(line) && !facilityName2) {
           const next = (hLines[li+1]||"").trim();
-          if (next.length >= 5) { facilityAddress = next; break; }
+          if (next.length >= 3 && !/^(ID|Prefix|Tag|SUMMARY|PLAN|Completion|STREET)/i.test(next)) {
+            facilityName2 = next;
+          }
+        }
+        // Layout A for address
+        if (/STREET ADDRESS/i.test(line) && !facilityAddress) {
+          const next = (hLines[li+1]||"").trim();
+          if (/^[0-9]/.test(next) && next.length >= 8) facilityAddress = next;
         }
       }
 
-      // Total pages from footer
-      const pagesMatch = fullText3000.match(/Page\s+\d+\s+of\s+(\d+)/i);
+      // ── Total pages ───────────────────────────────────────────────────────
+      const pagesMatch = fullText5000.match(/Page\s+\d+\s+of\s+(\d+)/i);
       const totalPages = pagesMatch ? parseInt(pagesMatch[1]) : null;
 
-      // Printed date
-      const printedMatch = hText.match(/PRINTED:\s*(\d{2}\/\d{2}\/\d{4})/i);
+      // ── Printed date ──────────────────────────────────────────────────────
+      const printedMatch = hText.match(/PRINTED[:\s]+(\d{2}\/\d{2}\/\d{4})/i);
       const printedDate = printedMatch ? printedMatch[1] : "";
-
-      // Facility name
-      const nameLines = hText.split("\n");
-      for (let li = 0; li < nameLines.length; li++) {
-        if (/NAME OF PROVIDER OR SUPPLIER/i.test(nameLines[li])) {
-          const nextLine = (nameLines[li + 1] || "").trim();
-          if (nextLine.length >= 3) { facilityName2 = nextLine; break; }
-        }
-      }
 
       surveyMetadata = {
         provider_name: facilityName2,
         provider_number: providerNumber,
         facility_id: facilityIdDoc,
         event_id: eventId,
-        survey_completed_date: dateMatch ? dateMatch[1] : "",
+        survey_completed_date: rawSurveyDate || surveyDate2 || "",
         facility_address: facilityAddress,
         total_pages: totalPages,
         printed_date: printedDate,
