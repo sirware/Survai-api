@@ -109,21 +109,20 @@ async function runBatchJob(batchId, citations, facility, settings, userId, facil
     let lastError = null;
 
     // F0000 = Initial Comments — no POC generated, stored as display-only record
-    const isF0000 = (citation.tags || []).some(t => t === 'F0000' || t === 'F000');
+    // Detected via tags OR via flags set by the parser
+    const isF0000 = (citation.tags || []).some(t => t === 'F0000' || t === 'F000')
+      || citation.is_initial_comments === true
+      || citation.no_poc === true;
     if (isF0000) {
       pipData = {
         statement_of_deficiency: citation.full_deficiency_text || citation.deficiency_statement || "",
-        root_cause_analysis: "",
-        immediate_corrective_actions: "",
-        residents_affected: "",
-        systemic_changes: "",
-        education_and_training: "",
-        policy_procedure_review: "",
-        monitoring_and_auditing: "",
-        sustainability_plan: "",
-        projected_compliance_date: "",
-        attestation: "",
+        root_cause_analysis: "", immediate_corrective_actions: "",
+        residents_affected: "", systemic_changes: "", education_and_training: "",
+        policy_procedure_review: "", monitoring_and_auditing: "", sustainability_plan: "",
+        projected_compliance_date: "", attestation: "",
         _initial_comments: true,
+        _no_poc: true,
+        _display_only: true,
       };
     } else {
       for (let attempt = 0; attempt < 2; attempt++) {
