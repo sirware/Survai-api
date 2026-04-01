@@ -108,14 +108,33 @@ async function runBatchJob(batchId, citations, facility, settings, userId, facil
     let pipData = null;
     let lastError = null;
 
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const guidance = "";
-        pipData = await generatePOCOnServer(citation, facility, guidance, settings.includeDates !== false);
-        break;
-      } catch (err) {
-        lastError = err;
-        if (attempt === 0) await new Promise(r => setTimeout(r, 1500));
+    // F0000 = Initial Comments — no POC generated, stored as display-only record
+    const isF0000 = (citation.tags || []).some(t => t === 'F0000' || t === 'F000');
+    if (isF0000) {
+      pipData = {
+        statement_of_deficiency: citation.full_deficiency_text || citation.deficiency_statement || "",
+        root_cause_analysis: "",
+        immediate_corrective_actions: "",
+        residents_affected: "",
+        systemic_changes: "",
+        education_and_training: "",
+        policy_procedure_review: "",
+        monitoring_and_auditing: "",
+        sustainability_plan: "",
+        projected_compliance_date: "",
+        attestation: "",
+        _initial_comments: true,
+      };
+    } else {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const guidance = "";
+          pipData = await generatePOCOnServer(citation, facility, guidance, settings.includeDates !== false);
+          break;
+        } catch (err) {
+          lastError = err;
+          if (attempt === 0) await new Promise(r => setTimeout(r, 1500));
+        }
       }
     }
 
@@ -136,8 +155,11 @@ async function runBatchJob(batchId, citations, facility, settings, userId, facil
         sections: pipData,
         citation_data: {
           ...citation,
-          // Ensure survey_metadata always exists so export can read it
-          survey_metadata: citation.survey_metadata || {},
+          // survey_metadata: use what frontend sent, fall back to what the parse job extracted
+          // This ensures header data always survives to export time
+          survey_metadata: (citation.survey_metadata && Object.keys(citation.survey_metadata).length > 0)
+            ? citation.survey_metadata
+            : (job?.result?.survey_metadata || {}),
           // Ensure verbatim fields always present
           full_deficiency_text: citation.full_deficiency_text || citation.raw_block || citation.deficiency_narrative_full || citation.deficiency_statement || "",
           // Persist initial_comments onto every citation so it survives navigation/session
