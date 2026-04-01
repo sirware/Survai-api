@@ -141,7 +141,7 @@ async function runBatchJob(batchId, citations, facility, settings, userId, facil
           // Ensure verbatim fields always present
           full_deficiency_text: citation.full_deficiency_text || citation.raw_block || citation.deficiency_narrative_full || citation.deficiency_statement || "",
           // Persist initial_comments onto every citation so it survives navigation/session
-          initial_comments: citation.initial_comments || job?.parseInitialComments || "",
+          initial_comments: citation.initial_comments || job?.result?.initial_comments || "",
         },
         batch_id: batchId,
         source_document: settings.sourceDocument || null,
