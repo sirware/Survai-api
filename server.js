@@ -178,11 +178,9 @@ async function runBatchJob(batchId, citations, facility, settings, userId, facil
       results[_idx] = newPip;
       job.done++;
     } else {
-      const batchErrMsg = lastError?.message || "Unknown error";
-      const isQuotaErr = /too many tokens|rate limit|quota|throttl/i.test(batchErrMsg);
-      console.warn(`[Batch ${batchId}] pipData null for ${citation.tags?.join(",") || "unknown"} — ${batchErrMsg}`);
+      console.warn(`[Batch ${batchId}] pipData null for ${citation.tags?.join(",") || "unknown"} — lastError: ${lastError?.message}`);
       job.failed++;
-      job.errors.push(`${citation.tags?.join(",")||"?"}: ${isQuotaErr ? "Token quota exceeded — retry after quota resets" : batchErrMsg.slice(0,80)}`);
+      job.errors.push(`${citation.tags?.join(",")}: ${lastError?.message || "Unknown error"}`);
     }
 
     job.current = job.done + job.failed;
@@ -636,7 +634,7 @@ function normalizeCitation(citation, surveyUid) {
 
 // ─── PDF Parse — server-side extraction, column-aware ────────────────────────
 app.post("/api/parse-pdf", async (req, res) => {
-  const { pdfBase64, facilityName, disableEnrichment } = req.body;
+  const { pdfBase64, facilityName } = req.body;
   if (!pdfBase64) return res.status(400).json({ error: "pdfBase64 is required" });
 
   try {
@@ -952,12 +950,8 @@ VERBATIM TEXT IS SOURCE OF TRUTH.`;
       return;
     }
 
-    if (job.disableEnrichment) {
-      console.log("[Parse " + jobId + "] AI enrichment disabled by admin setting — deterministic extraction only");
-    }
-
     const parseResult = await parseCMS2567(docText, {
-      aiExtractor: job.disableEnrichment ? null : aiExtractor,
+      aiExtractor,
       concurrency: 4,
     });
 
@@ -1137,7 +1131,6 @@ app.post("/api/parse/start", async (req, res) => {
 
   const jobId = "parse-" + Date.now() + "-" + Math.random().toString(36).slice(2, 7);
   const job = { jobId, status: "queued", pages: 0, chars: 0, totalChunks: 0, currentChunk: 0, result: null, error: null };
-  job.disableEnrichment = req.body.disableEnrichment === true;
   parseJobs.set(jobId, job);
 
   runParseJob(jobId, pdfBase64, facilityName).catch(e => {
