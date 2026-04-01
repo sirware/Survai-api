@@ -134,7 +134,13 @@ async function runBatchJob(batchId, citations, facility, settings, userId, facil
         mode_reason: "Claude API — Server Batch",
         status: "Draft",
         sections: pipData,
-        citation_data: citation,
+        citation_data: {
+          ...citation,
+          // Ensure survey_metadata always exists so export can read it
+          survey_metadata: citation.survey_metadata || {},
+          // Ensure verbatim fields always present
+          full_deficiency_text: citation.full_deficiency_text || citation.raw_block || citation.deficiency_narrative_full || citation.deficiency_statement || "",
+        },
         batch_id: batchId,
         source_document: settings.sourceDocument || null,
         version_history: [],
@@ -950,8 +956,11 @@ VERBATIM TEXT IS SOURCE OF TRUTH.`;
       return;
     }
 
+    if (job.disableEnrichment) {
+      console.log("[Parse " + jobId + "] AI enrichment DISABLED by admin setting");
+    }
     const parseResult = await parseCMS2567(docText, {
-      aiExtractor,
+      aiExtractor: job.disableEnrichment ? null : aiExtractor,
       concurrency: 4,
     });
 
@@ -1126,11 +1135,11 @@ VERBATIM TEXT IS SOURCE OF TRUTH.`;
 }
 
 app.post("/api/parse/start", async (req, res) => {
-  const { pdfBase64, facilityName } = req.body;
+  const { pdfBase64, facilityName, disableEnrichment } = req.body;
   if (!pdfBase64) return res.status(400).json({ error: "pdfBase64 is required" });
 
   const jobId = "parse-" + Date.now() + "-" + Math.random().toString(36).slice(2, 7);
-  const job = { jobId, status: "queued", pages: 0, chars: 0, totalChunks: 0, currentChunk: 0, result: null, error: null };
+  const job = { jobId, status: "queued", pages: 0, chars: 0, totalChunks: 0, currentChunk: 0, result: null, error: null, disableEnrichment: disableEnrichment === true };
   parseJobs.set(jobId, job);
 
   runParseJob(jobId, pdfBase64, facilityName).catch(e => {
