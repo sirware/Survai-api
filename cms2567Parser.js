@@ -62,12 +62,12 @@ function segmentCitationBlocks(rawText) {
     const m = part.match(TAG_RE);
     if (!m) continue;
     const tag = m[1].toUpperCase();
-    if (tag === 'F0000' || tag === 'K0000' || tag === 'E0000') continue;
+    if (tag === 'K0000' || tag === 'E0000') continue; // skip LSC/EP zero tags
+    // F0000 is kept — it is Initial Comments, treated like any other tag (no POC generated)
     if (!tagMap.has(tag)) {
       tagMap.set(tag, part);
       tagOrder.push(tag);
     } else {
-      // Same tag = continuation — APPEND (merge)
       tagMap.set(tag, tagMap.get(tag) + '\n' + part);
     }
   }
@@ -75,17 +75,27 @@ function segmentCitationBlocks(rawText) {
   return tagOrder.map(tag => {
     const raw = tagMap.get(tag);
     const ssM = raw.match(/SS\s*=\s*([A-L])/i);
+    // Cut right-column POC contamination before storing
+    const safRaw = cutAtPOCBoundary(raw);
     return {
       tag_number: tag,
       scope_severity_hint: ssM ? ssM[1].toUpperCase() : '',
-      raw_block: raw,
-      clean_block: cleanBlock(raw),
+      raw_block: safRaw,
+      clean_block: cleanBlock(safRaw),
     };
   }).filter(b => b.raw_block.trim());
 }
 
+// POC boundary markers — stop extraction before right-column content
+const POC_BOUNDARY_RE = /^\s*(A\.\s*CORRECTIVE\s*ACTION|B\.\s*RESIDENTS\s*AFFECTED|C\.\s*SYSTEMIC\s*CHANGES|D\.\s*MONITORING\s*AND|EDUCATION\s*AND\s*TRAINING:|POLICY\s*(AND|PROCEDURE)\s*REVIEW:|SUSTAINABILITY\s*PLAN:)/im
+
+function cutAtPOCBoundary(text) {
+  const m = text.search(POC_BOUNDARY_RE);
+  return m > 50 ? text.slice(0, m).trim() : text;
+}
+
 function buildFallbackCitation(rawBlock, cleanedBlock, tag, scopeSeverity) {
-  const full = cleanedBlock || rawBlock || '';
+  const full = cutAtPOCBoundary(cleanedBlock || rawBlock || '');
   const ss = scopeSeverity || (full.match(/SS\s*=\s*([A-L])/i)||[])[1]?.toUpperCase() || '';
   const cfr = unique(safeMatchAll(full, /483\.\d+(?:\([a-z0-9]+\))*(?:-\([a-z0-9]+\))?/gi));
 
@@ -158,7 +168,7 @@ function buildFallbackCitation(rawBlock, cleanedBlock, tag, scopeSeverity) {
 
 // Hard fail ONLY: no tag, or block is clearly empty/header-only
 function isMinimallyUsable(c) {
-  if (!c || !c.tag_number || c.tag_number === 'F0000') return false;
+  if (!c || !c.tag_number) return false;
   return (c.full_deficiency_text||c.deficiency_narrative_full||'').trim().length >= 20;
 }
 
@@ -166,26 +176,32 @@ async function parseCMS2567(rawText, options = {}) {
   const { aiExtractor = null, concurrency = 4 } = options;
   const blocks = segmentCitationBlocks(rawText);
 
-  // Extract F0000 Initial Comments as survey metadata (not a citation)
-  let initialComments = '';
-  try {
-    const cleanedForF0000 = cleanForSegmentation(rawText);
-    const f0000start = cleanedForF0000.search(/F0+\s+INITIAL COMMENTS/i);
-    if (f0000start !== -1) {
-      const afterF0000 = cleanedForF0000.slice(f0000start);
-      const nextTagIdx = afterF0000.search(/\n[FKE]\d{3,4}\s/);
-      const f0000end = nextTagIdx !== -1 ? f0000start + nextTagIdx : f0000start + 2000;
-      initialComments = cleanedForF0000.slice(f0000start, f0000end)
-        .replace(/F0+\s+INITIAL COMMENTS\s*/i, '')
-        .trim();
-    }
-  } catch(e) {}
+  // F0000 Initial Comments is now extracted as a regular citation block
+  // It appears first in tagOrder (sorted by tag number) — no POC is generated for it
+  let initialComments = ''; // kept for backward compat — populated below after citations built
 
   if (!blocks.length) {
-    return { document_type:'CMS-2567', citations:[], initial_comments: initialComments, stats:{ candidate_count:0, usable_count:0, ai_count:0, fallback_count:0 } };
+    return { document_type:'CMS-2567', citations:[], initial_comments: '', stats:{ candidate_count:0, usable_count:0, ai_count:0, fallback_count:0 } };
   }
 
-  const fallbacks = blocks.map(b => buildFallbackCitation(b.raw_block, b.clean_block, b.tag_number, b.scope_severity_hint));
+  const fallbacks = blocks.map(b => {
+    const cit = buildFallbackCitation(b.raw_block, b.clean_block, b.tag_number, b.scope_severity_hint);
+    // F0000 = Initial Comments — first-class row, no POC required
+    if (b.tag_number === 'F0000') {
+      cit.no_poc = true;
+      cit.display_only = true;
+      cit.is_initial_comments = true;
+      cit.title = 'Initial Comments';
+      cit.regulatory_title = 'Initial Comments';
+    }
+    return cit;
+  });
+  // Populate initialComments from F0000 citation block for backward compat
+  const f0000block = blocks.find(b => b.tag_number === 'F0000');
+  if (f0000block) {
+    initialComments = f0000block.clean_block
+      .replace(/^F0+\s*/i, '').replace(/^INITIAL COMMENTS\s*/i, '').trim();
+  }
 
   if (!aiExtractor) {
     const all = fallbacks.map(c => ({ ...c, requires_human_review: !isMinimallyUsable(c) }));
