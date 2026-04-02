@@ -185,12 +185,14 @@ async function runBatchJob(batchId, citations, facility, settings, userId, facil
 
       // Save to Supabase immediately — all fields needed by dbToLocal mapping
       try {
+        // Extract survey document header values to save as dedicated columns
+        const _sm = newPip.citation_data?.survey_metadata || {};
         await supabase.from("pocs").insert({
           id: newPip.id,
           facility_id: facilityId,
           facility_name: facility.facility_name,
           tags: newPip.tags,
-          survey_date: newPip.survey_date,
+          survey_date: _sm.survey_completed_date || newPip.survey_date,
           survey_type: newPip.survey_type,
           scope_severity: newPip.scope_severity,
           status: "Draft",
@@ -1182,13 +1184,21 @@ VERBATIM TEXT IS SOURCE OF TRUTH.`;
     const stubCount = deduped.filter(c => c._stub).length;
     const visionFallbackSuggested = stubCount > 0 || hardFailCount > Math.floor(deduped.length * 0.3);
 
+    // Inject survey_metadata into every citation so it's saved in Supabase citation_data
+    // This is the permanent storage path — job.result is in-memory only
+    const dedupedWithMeta = deduped.map(c => ({
+      ...c,
+      survey_metadata: surveyMetadata,
+      initial_comments: c.initial_comments || parseResult.initial_comments || "",
+    }));
+
     job.result = {
       facility_name: facilityName2,
       survey_date: surveyDate2,
       survey_type: surveyType2,
       initial_comments: parseResult.initial_comments || "",
       survey_metadata: surveyMetadata,
-      citations: deduped,
+      citations: dedupedWithMeta,
       validation_summary: {
         total: deduped.length,
         approved: approvedCount,
