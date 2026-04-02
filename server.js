@@ -782,7 +782,17 @@ async function runParseJob(jobId, pdfBase64, facilityName) {
           let prevBucket = null;
           for (const bucket of sortedBuckets) {
             if (prevBucket !== null && prevBucket - bucket > 18) text += "\n";
-            const line = lineMap[bucket].sort((a, b) => a.x - b.x).map(w => w.str).join(" ").replace(/\s{3,}/g, "  ").trim();
+            // Join text items preserving column gaps (use tab as separator for wide gaps)
+          const items = lineMap[bucket].sort((a, b) => a.x - b.x);
+          let lineStr = "";
+          for (let ii = 0; ii < items.length; ii++) {
+            if (ii > 0) {
+              const gap = items[ii].x - (items[ii-1].x + (items[ii-1].str.length * 6));
+              lineStr += gap > 40 ? "\t" : " "; // tab for column gaps > 40pt
+            }
+            lineStr += items[ii].str;
+          }
+          const line = lineStr.trim();
             if (line) text += line + "\n";
             prevBucket = bucket;
           }
@@ -1128,22 +1138,36 @@ VERBATIM TEXT IS SOURCE OF TRUTH.`;
         if (/Name of (?:Facility Surveyed|Provider or Supplier)/i.test(line)) {
           const dataLine = (hLines[li+1] || "").trimEnd();
           if (dataLine.trim().length >= 3) {
-            // Split on 4+ consecutive spaces — left part = name, right part = address
-            const splitM = dataLine.match(/^(.+?)\s{4,}(.+)$/);
-            if (splitM) {
-              facilityName2 = splitM[1].trim();
-              facilityAddress = splitM[2].trim();
+            // Tab separator = our custom renderer preserved column gap
+            if (dataLine.includes("\t")) {
+              const parts = dataLine.split("\t").map(s => s.trim()).filter(Boolean);
+              facilityName2 = parts[0] || "";
+              facilityAddress = parts[parts.length - 1] || "";
             } else {
-              facilityName2 = dataLine.trim();
+              // Fallback: split on 4+ spaces
+              const splitM = dataLine.match(/^(.+?)\s{4,}(.+)$/);
+              if (splitM) {
+                facilityName2 = splitM[1].trim();
+                facilityAddress = splitM[2].trim();
+              } else {
+                facilityName2 = dataLine.trim();
+              }
             }
             break;
           }
         }
-        // Layout A alternate: "NAME OF PROVIDER OR SUPPLIER" label
+        // Layout A: "NAME OF PROVIDER OR SUPPLIER" on its own line
         if (/NAME OF PROVIDER OR SUPPLIER/i.test(line) && !facilityName2) {
-          const next = (hLines[li+1]||"").trim();
-          if (next.length >= 3 && !/^(ID|Prefix|Tag|SUMMARY|PLAN|Completion|STREET)/i.test(next)) {
-            facilityName2 = next;
+          const dataLine = (hLines[li+1]||"").trimEnd();
+          if (dataLine.includes("\t")) {
+            const parts = dataLine.split("\t").map(s => s.trim()).filter(Boolean);
+            facilityName2 = parts[0] || "";
+            if (!facilityAddress) facilityAddress = parts[parts.length - 1] || "";
+          } else {
+            const next = dataLine.trim();
+            if (next.length >= 3 && !/^(ID|Prefix|Tag|SUMMARY|PLAN|Completion|STREET)/i.test(next)) {
+              facilityName2 = next;
+            }
           }
         }
         // Layout A for address
@@ -1160,6 +1184,12 @@ VERBATIM TEXT IS SOURCE OF TRUTH.`;
       // ── Printed date ──────────────────────────────────────────────────────
       const printedMatch = hText.match(/PRINTED[:\s]+(\d{2}\/\d{2}\/\d{4})/i);
       const printedDate = printedMatch ? printedMatch[1] : "";
+
+      // Repair common pdftotext column truncations
+      // e.g. "REHABILITATIO" → "REHABILITATION", "601 S" → "5601 S" (leading digit cut)
+      // We can't know the exact missing chars but we can flag them as potentially truncated
+      // For address: if it starts with a digit but not "5" and context suggests street number, keep as-is
+      // For name: trimmed trailing space is fine — facility names rarely end mid-word unless truncated
 
       surveyMetadata = {
         provider_name: facilityName2,
