@@ -41,7 +41,12 @@ const DEFAULT_SIGNERS = [
 ];
 
 async function generatePOCOnServer(citation, facility, guidance, includeDates) {
-  const systemPrompt = `You are a healthcare compliance specialist. Generate a complete Plan of Correction for a CMS deficiency citation. Return ONLY valid JSON, no markdown. Format: {"statement_of_deficiency":"","root_cause_analysis":"","immediate_corrective_actions":"","residents_affected":"","systemic_changes":"","education_and_training":"","policy_procedure_review":"","monitoring_and_auditing":"","sustainability_plan":"","projected_compliance_date":"","attestation":""}`;
+  const systemPrompt = `You are a healthcare compliance specialist. Generate a complete Plan of Correction for a CMS deficiency citation. Return ONLY valid JSON, no markdown. Format: {"statement_of_deficiency":"","root_cause_analysis":"","immediate_corrective_actions":"","residents_affected":"","systemic_changes":"","education_and_training":"","policy_procedure_review":"","monitoring_and_auditing":"","sustainability_plan":"","projected_compliance_date":"","attestation":""}
+
+LANGUAGE RULES — MANDATORY:
+- Do NOT use the word "all" when referring to nurses, nursing staff, or any staff group (e.g. do NOT write "all nurses", "all nursing staff", "all staff"). Surveyors flag this as unrealistic. Instead write "nursing staff", "licensed nursing staff", "direct care staff", "staff responsible for [task]", etc.
+- Do NOT use "all residents" — write "residents", "current residents", or "affected residents".
+- Use specific, actionable language. Avoid overpromising scope.`;
 
   const dateInstruction = includeDates
     ? "Include specific calendar dates in corrective actions."
@@ -128,7 +133,8 @@ async function runBatchJob(batchId, citations, facility, settings, userId, facil
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
           const guidance = "";
-          pipData = await generatePOCOnServer(citation, facility, guidance, settings.includeDates !== false);
+          // includeDates defaults to OFF — only true if explicitly set
+          pipData = await generatePOCOnServer(citation, facility, guidance, settings.includeDates === true);
           break;
         } catch (err) {
           lastError = err;
@@ -155,10 +161,17 @@ async function runBatchJob(batchId, citations, facility, settings, userId, facil
         citation_data: {
           ...citation,
           // survey_metadata: use what frontend sent, fall back to what the parse job extracted
-          // This ensures header data always survives to export time
-          survey_metadata: (citation.survey_metadata && Object.keys(citation.survey_metadata).length > 0)
-            ? citation.survey_metadata
-            : (job?.result?.survey_metadata || {}),
+          survey_metadata: (() => {
+            const fromCitation = citation.survey_metadata && Object.keys(citation.survey_metadata).length > 0
+              ? citation.survey_metadata : null;
+            const fromBatchJob = job?.result?.survey_metadata && Object.keys(job.result.survey_metadata).length > 0
+              ? job.result.survey_metadata : null;
+            const meta = fromCitation || fromBatchJob || {};
+            if (!fromCitation && fromBatchJob) {
+              console.log("[Batch] survey_metadata from parse job for " + (citation.tags||[]).join(",") + ":", fromBatchJob.provider_name);
+            }
+            return meta;
+          })(),
           // Ensure verbatim fields always present
           full_deficiency_text: citation.full_deficiency_text || citation.raw_block || citation.deficiency_narrative_full || citation.deficiency_statement || "",
           // Persist initial_comments onto every citation so it survives navigation/session
@@ -1156,6 +1169,12 @@ VERBATIM TEXT IS SOURCE OF TRUTH.`;
         total_pages: totalPages,
         printed_date: printedDate,
       };
+      console.log("[Parse " + jobId + "] survey_metadata extracted:", JSON.stringify({
+        provider_name: surveyMetadata.provider_name,
+        provider_number: surveyMetadata.provider_number,
+        survey_completed_date: surveyMetadata.survey_completed_date,
+        facility_address: surveyMetadata.facility_address,
+      }));
     } catch(e) { console.warn("[Parse] Header extraction error:", e.message); }
 
     job.status = "complete";
