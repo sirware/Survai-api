@@ -167,9 +167,6 @@ async function runBatchJob(batchId, citations, facility, settings, userId, facil
             const fromBatchJob = job?.result?.survey_metadata && Object.keys(job.result.survey_metadata).length > 0
               ? job.result.survey_metadata : null;
             const meta = fromCitation || fromBatchJob || {};
-            if (!fromCitation && fromBatchJob) {
-              console.log("[Batch] survey_metadata from parse job for " + (citation.tags||[]).join(",") + ":", fromBatchJob.provider_name);
-            }
             return meta;
           })(),
           // Ensure verbatim fields always present
@@ -1201,12 +1198,6 @@ VERBATIM TEXT IS SOURCE OF TRUTH.`;
         total_pages: totalPages,
         printed_date: printedDate,
       };
-      console.log("[Parse " + jobId + "] survey_metadata extracted:", JSON.stringify({
-        provider_name: surveyMetadata.provider_name,
-        provider_number: surveyMetadata.provider_number,
-        survey_completed_date: surveyMetadata.survey_completed_date,
-        facility_address: surveyMetadata.facility_address,
-      }));
     } catch(e) { console.warn("[Parse] Header extraction error:", e.message); }
 
     job.status = "complete";
