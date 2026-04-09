@@ -682,12 +682,35 @@ app.post("/api/parse-pdf", async (req, res) => {
     const pdfBuffer = Buffer.from(pdfBase64, "base64");
 
     // Custom page renderer — sorts items by Y then X to preserve column structure
+    // tag-bank mode: track left+right columns separately per line
+    // survey mode: merge all items into single text stream (existing behavior)
+    const isTagBankMode = mode === "tag-bank";
+
+    // Store right-column text separately when in tag-bank mode
+    const rightColumnByY = {};
+
     const pagerender = (pageData) => {
       return pageData.getTextContent({
         normalizeWhitespace: false,
         disableCombineTextItems: false,
       }).then((textContent) => {
         if (!textContent.items.length) return "";
+
+        // Detect page midpoint X for column split (tag-bank mode only)
+        let midX = 300; // default pt midpoint
+        if (isTagBankMode && textContent.items.length > 4) {
+          const xVals = textContent.items.map(i => i.transform[4]).filter(x => x > 20);
+          xVals.sort((a, b) => a - b);
+          // Midpoint is roughly where right column starts — find largest gap
+          let maxGap = 0, gapX = midX;
+          for (let i = 1; i < xVals.length; i++) {
+            const gap = xVals[i] - xVals[i-1];
+            if (gap > maxGap && xVals[i-1] > 80 && xVals[i] < 560) {
+              maxGap = gap; gapX = (xVals[i] + xVals[i-1]) / 2;
+            }
+          }
+          if (maxGap > 30) midX = gapX;
+        }
 
         // Group items into lines using Y position (within 4pt = same line)
         const lineMap = {};
@@ -708,15 +731,25 @@ app.post("/api/parse-pdf", async (req, res) => {
           // Add extra blank line when large vertical gap — signals new citation section
           if (prevBucket !== null && prevBucket - bucket > 18) text += "\n";
 
-          // Sort items left-to-right within each line
-          const line = lineMap[bucket]
-            .sort((a, b) => a.x - b.x)
-            .map(w => w.str)
-            .join(" ")
-            .replace(/\s{3,}/g, "  ")
-            .trim();
+          const items = lineMap[bucket].sort((a, b) => a.x - b.x);
 
-          if (line) text += line + "\n";
+          if (isTagBankMode) {
+            // Split items into left (deficiency) and right (POC) columns
+            const leftItems = items.filter(w => w.x < midX);
+            const rightItems = items.filter(w => w.x >= midX);
+            const leftLine = leftItems.map(w => w.str).join(" ").replace(/\s{3,}/g, "  ").trim();
+            const rightLine = rightItems.map(w => w.str).join(" ").replace(/\s{3,}/g, "  ").trim();
+            if (leftLine) text += leftLine + "\n";
+            // Accumulate right column keyed by bucket for later matching
+            if (rightLine) {
+              if (!rightColumnByY[bucket]) rightColumnByY[bucket] = [];
+              rightColumnByY[bucket].push(rightLine);
+            }
+          } else {
+            // Original behavior — merge both columns
+            const line = items.map(w => w.str).join(" ").replace(/\s{3,}/g, "  ").trim();
+            if (line) text += line + "\n";
+          }
           prevBucket = bucket;
         }
         return text;
@@ -753,7 +786,7 @@ app.post("/api/parse-pdf", async (req, res) => {
 // Runs entirely on Render — browser can navigate away, results polled by client
 const parseJobs = new Map();
 
-async function runParseJob(jobId, pdfBase64, facilityName) {
+async function runParseJob(jobId, pdfBase64, facilityName, mode = "survey") {
   const job = parseJobs.get(jobId);
   if (!job) return;
 
@@ -1207,11 +1240,26 @@ VERBATIM TEXT IS SOURCE OF TRUTH.`;
 
     // Inject survey_metadata into every citation so it's saved in Supabase citation_data
     // This is the permanent storage path — job.result is in-memory only
-    const dedupedWithMeta = deduped.map(c => ({
-      ...c,
-      survey_metadata: surveyMetadata,
-      initial_comments: c.initial_comments || parseResult.initial_comments || "",
-    }));
+    // In tag-bank mode, also attach right-column POC text collected during pagerender
+    const rightColLines = Object.values(rightColumnByY).flat();
+    const rightColText = rightColLines.join(" ").trim();
+    const dedupedWithMeta = deduped.map((c, idx) => {
+      // For tag-bank mode, distribute right column text across citations
+      // Simple approach: assign right column text proportionally by citation count
+      let poc_text = "";
+      if (isTagBankMode && rightColText.length > 20) {
+        const chunkSize = Math.ceil(rightColLines.length / Math.max(deduped.length, 1));
+        const start = idx * chunkSize;
+        const end = start + chunkSize;
+        poc_text = rightColLines.slice(start, end).join(" ").trim();
+      }
+      return {
+        ...c,
+        survey_metadata: surveyMetadata,
+        initial_comments: c.initial_comments || parseResult.initial_comments || "",
+        poc_text,
+      };
+    });
 
     job.result = {
       facility_name: facilityName2,
@@ -1241,14 +1289,14 @@ VERBATIM TEXT IS SOURCE OF TRUTH.`;
 }
 
 app.post("/api/parse/start", async (req, res) => {
-  const { pdfBase64, facilityName, disableEnrichment } = req.body;
+  const { pdfBase64, facilityName, disableEnrichment, mode } = req.body;
   if (!pdfBase64) return res.status(400).json({ error: "pdfBase64 is required" });
 
   const jobId = "parse-" + Date.now() + "-" + Math.random().toString(36).slice(2, 7);
-  const job = { jobId, status: "queued", pages: 0, chars: 0, totalChunks: 0, currentChunk: 0, result: null, error: null, disableEnrichment: disableEnrichment === true };
+  const job = { jobId, status: "queued", pages: 0, chars: 0, totalChunks: 0, currentChunk: 0, result: null, error: null, disableEnrichment: disableEnrichment === true, mode: mode || "survey" };
   parseJobs.set(jobId, job);
 
-  runParseJob(jobId, pdfBase64, facilityName).catch(e => {
+  runParseJob(jobId, pdfBase64, facilityName, mode || "survey").catch(e => {
     const j = parseJobs.get(jobId);
     if (j) { j.status = "error"; j.error = e.message; }
   });
