@@ -1034,6 +1034,67 @@ VERBATIM TEXT IS SOURCE OF TRUTH.`;
       return;
     }
 
+    // ── TAG BANK FAST PATH ─────────────────────────────────────────────────────
+    // For tag-bank mode, skip the full parseCMS2567 pipeline entirely.
+    // We just need tag numbers + left-column deficiency text. No AI, no enrichment.
+    // Right-column POC text was already captured in rightColumnByY during pagerender.
+    if (mode === "tag-bank") {
+      console.log("[Parse " + jobId + "] TAG-BANK fast path — skipping parseCMS2567");
+      job.status = "building";
+
+      // Extract all F/E/K tags directly from raw text using simple regex
+      const tagPattern = /^(F\d{4}|E\d{4}|K\d{4})/gm;
+      const tagMatches = [...docText.matchAll(tagPattern)];
+      const tagPositions = tagMatches.map(m => ({ tag: m[1], index: m.index }));
+
+      job.totalChunks = tagPositions.length;
+      job.found = tagPositions.length;
+
+      // Build citations from text between each tag marker
+      const fastCitations = tagPositions
+        .filter(t => t.tag !== "F0000")
+        .map((t, i) => {
+          const nextPos = tagPositions[i + 1] ? tagPositions[i + 1].index : docText.length;
+          const block = docText.slice(t.index, nextPos).trim();
+          // Try to extract scope/severity — typically follows tag number as single letter
+          const ssMatch = block.match(/^(?:F|E|K)\d{4}\s+([A-I])/);
+          job.currentChunk = i + 1;
+          return {
+            tag_number: t.tag,
+            scope_severity: ssMatch ? ssMatch[1] : "",
+            regulatory_title: "",
+            full_deficiency_text: block.slice(0, 2000),
+            poc_text: "",
+            sections: {},
+            survey_metadata: surveyMetadata,
+          };
+        });
+
+      // Attach right-column text if captured during pagerender
+      const rightLines = Object.values(rightColumnByY).flat();
+      const rightText = rightLines.join(" ").trim();
+      if (rightText.length > 20 && fastCitations.length > 0) {
+        const chunkSize = Math.ceil(rightLines.length / fastCitations.length);
+        fastCitations.forEach((c, i) => {
+          c.poc_text = rightLines.slice(i * chunkSize, (i + 1) * chunkSize).join(" ").trim();
+        });
+      }
+
+      job.result = {
+        facility_name: facilityName,
+        survey_date: surveyMetadata?.survey_completed_date || null,
+        survey_type: null,
+        initial_comments: "",
+        survey_metadata: surveyMetadata,
+        citations: fastCitations,
+        validation_summary: { total: fastCitations.length, approved: 0, needs_review: fastCitations.length, hard_fails: 0, stubs: 0, candidate_count: fastCitations.length },
+      };
+      job.status = "complete";
+      console.log("[Parse " + jobId + "] TAG-BANK complete — " + fastCitations.length + " citations in fast path");
+      return;
+    }
+    // ── END TAG BANK FAST PATH ─────────────────────────────────────────────────
+
     if (job.disableEnrichment) {
       console.log("[Parse " + jobId + "] AI enrichment DISABLED by admin setting");
     }
