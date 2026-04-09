@@ -1034,6 +1034,31 @@ VERBATIM TEXT IS SOURCE OF TRUTH.`;
       return;
     }
 
+    // ── EARLY METADATA EXTRACTION (used by both survey and tag-bank paths) ──────
+    // Extract survey metadata from header before any fast-path returns
+    let surveyMetadata = {};
+    try {
+      const hText = docText.slice(0, 4000);
+      const dateMMDD = hText.match(/DATE SURVEY COMPLETED[\s\S]{0,300}?(\d{2}\/\d{2}\/\d{4})/i);
+      const dateISO  = hText.match(/DATE SURVEY COMPLETED[\s\S]{0,300}?(\d{4}-\d{2}-\d{2})/i);
+      let surveyDateEarly = null;
+      if (dateMMDD) { const [m,d,y] = dateMMDD[1].split("/"); surveyDateEarly = y+"-"+m+"-"+d; }
+      else if (dateISO) { surveyDateEarly = dateISO[1]; }
+      const nameMatch = hText.match(/(?:PROVIDER\/SUPPLIER\/LTCH NAME|FACILITY NAME)[:\s]+([^
+]{4,80})/i);
+      const ccnMatch  = hText.match(/(?:CCN|PROVIDER\/SUPPLIER|CMS CERTIFICATION NUMBER)[:\s#]*([0-9A-Z]{6,10})/i);
+      const addrMatch = hText.match(/STREET ADDRESS[:\s]+([^
+]{4,80})/i);
+      surveyMetadata = {
+        survey_completed_date: surveyDateEarly,
+        provider_name: nameMatch ? nameMatch[1].trim() : (facilityName || ""),
+        ccn: ccnMatch ? ccnMatch[1].trim() : "",
+        street_address: addrMatch ? addrMatch[1].trim() : "",
+      };
+    } catch(metaErr) {
+      console.warn("[Parse " + jobId + "] Early metadata extraction failed:", metaErr.message);
+    }
+
     // ── TAG BANK FAST PATH ─────────────────────────────────────────────────────
     // For tag-bank mode, skip the full parseCMS2567 pipeline entirely.
     // We just need tag numbers + left-column deficiency text. No AI, no enrichment.
@@ -1176,7 +1201,8 @@ VERBATIM TEXT IS SOURCE OF TRUTH.`;
     let facilityName2 = facilityName || "";
     let surveyDate2 = null;
     let surveyType2 = null;
-    let surveyMetadata = {};
+    // surveyMetadata already declared above — re-populate with full extraction
+    surveyMetadata = {};
     try {
       // Use first 4000 chars for header extraction — covers multi-column layout
       const hText = docText.slice(0, 4000);
