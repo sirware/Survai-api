@@ -1044,11 +1044,9 @@ VERBATIM TEXT IS SOURCE OF TRUTH.`;
       let surveyDateEarly = null;
       if (dateMMDD) { const [m,d,y] = dateMMDD[1].split("/"); surveyDateEarly = y+"-"+m+"-"+d; }
       else if (dateISO) { surveyDateEarly = dateISO[1]; }
-      const nameMatch = hText.match(/(?:PROVIDER\/SUPPLIER\/LTCH NAME|FACILITY NAME)[:\s]+([^
-]{4,80})/i);
+      const nameMatch = hText.match(/(?:PROVIDER\/SUPPLIER\/LTCH NAME|FACILITY NAME)[:\s]+([^\r\n]{4,80})/i);
       const ccnMatch  = hText.match(/(?:CCN|PROVIDER\/SUPPLIER|CMS CERTIFICATION NUMBER)[:\s#]*([0-9A-Z]{6,10})/i);
-      const addrMatch = hText.match(/STREET ADDRESS[:\s]+([^
-]{4,80})/i);
+      const addrMatch = hText.match(/STREET ADDRESS[:\s]+([^\r\n]{4,80})/i);
       surveyMetadata = {
         survey_completed_date: surveyDateEarly,
         provider_name: nameMatch ? nameMatch[1].trim() : (facilityName || ""),
