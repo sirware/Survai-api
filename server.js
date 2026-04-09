@@ -682,12 +682,7 @@ app.post("/api/parse-pdf", async (req, res) => {
     const pdfBuffer = Buffer.from(pdfBase64, "base64");
 
     // Custom page renderer — sorts items by Y then X to preserve column structure
-    // tag-bank mode: track left+right columns separately per line
-    // survey mode: merge all items into single text stream (existing behavior)
-    const isTagBankMode = mode === "tag-bank";
-
-    // Store right-column text separately when in tag-bank mode
-    const rightColumnByY = {};
+    // tag-bank mode: isTagBankMode and rightColumnByY declared at function scope above
 
     const pagerender = (pageData) => {
       return pageData.getTextContent({
@@ -792,6 +787,8 @@ async function runParseJob(jobId, pdfBase64, facilityName, mode = "survey") {
 
   // Declare at function scope — must be available before try block and fast path
   var surveyMetadata = {};
+  var isTagBankMode = (mode === "tag-bank");
+  var rightColumnByY = {};
 
   try {
     // Step 1: Extract text from PDF using pdf-parse
