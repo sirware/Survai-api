@@ -790,6 +790,9 @@ async function runParseJob(jobId, pdfBase64, facilityName, mode = "survey") {
   const job = parseJobs.get(jobId);
   if (!job) return;
 
+  // Declare at function scope — must be available before try block and fast path
+  var surveyMetadata = {};
+
   try {
     // Step 1: Extract text from PDF using pdf-parse
     job.status = "extracting";
@@ -1035,8 +1038,7 @@ VERBATIM TEXT IS SOURCE OF TRUTH.`;
     }
 
     // ── EARLY METADATA EXTRACTION (used by both survey and tag-bank paths) ──────
-    // Extract survey metadata from header before any fast-path returns
-    let surveyMetadata = {};
+    // surveyMetadata declared at function scope above
     try {
       const hText = docText.slice(0, 4000);
       const dateMMDD = hText.match(/DATE SURVEY COMPLETED[\s\S]{0,300}?(\d{2}\/\d{2}\/\d{4})/i);
@@ -1199,7 +1201,7 @@ VERBATIM TEXT IS SOURCE OF TRUTH.`;
     let facilityName2 = facilityName || "";
     let surveyDate2 = null;
     let surveyType2 = null;
-    // surveyMetadata already declared above — re-populate with full extraction
+    // Re-populate surveyMetadata with full header extraction for survey path
     surveyMetadata = {};
     try {
       // Use first 4000 chars for header extraction — covers multi-column layout
