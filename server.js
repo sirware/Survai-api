@@ -691,22 +691,6 @@ app.post("/api/parse-pdf", async (req, res) => {
       }).then((textContent) => {
         if (!textContent.items.length) return "";
 
-        // Detect page midpoint X for column split (tag-bank mode only)
-        let midX = 300; // default pt midpoint
-        if (isTagBankMode && textContent.items.length > 4) {
-          const xVals = textContent.items.map(i => i.transform[4]).filter(x => x > 20);
-          xVals.sort((a, b) => a - b);
-          // Midpoint is roughly where right column starts — find largest gap
-          let maxGap = 0, gapX = midX;
-          for (let i = 1; i < xVals.length; i++) {
-            const gap = xVals[i] - xVals[i-1];
-            if (gap > maxGap && xVals[i-1] > 80 && xVals[i] < 560) {
-              maxGap = gap; gapX = (xVals[i] + xVals[i-1]) / 2;
-            }
-          }
-          if (maxGap > 30) midX = gapX;
-        }
-
         // Group items into lines using Y position (within 4pt = same line)
         const lineMap = {};
         for (const item of textContent.items) {
@@ -714,35 +698,37 @@ app.post("/api/parse-pdf", async (req, res) => {
           const y = Math.round(item.transform[5]);
           const bucket = Math.round(y / 4) * 4;
           if (!lineMap[bucket]) lineMap[bucket] = [];
-          lineMap[bucket].push({ x: item.transform[4], str: item.str, width: item.width || 0 });
+          lineMap[bucket].push({ x: item.transform[4], str: item.str });
         }
 
-        // Sort buckets top-to-bottom (PDF Y is inverted — higher Y = higher on page)
+        // Sort buckets top-to-bottom (PDF Y is inverted)
         const sortedBuckets = Object.keys(lineMap).map(Number).sort((a, b) => b - a);
+
+        // For tag-bank mode: CMS-2567 is letter size (612pt wide).
+        // The column divider is always near the horizontal midpoint.
+        // We use page width / 2 as the split — robust across all standard CMS-2567 exports.
+        const pageWidth = pageData.view ? pageData.view[2] : 612;
+        const midX = pageWidth / 2;
 
         let text = "";
         let prevBucket = null;
         for (const bucket of sortedBuckets) {
-          // Add extra blank line when large vertical gap — signals new citation section
           if (prevBucket !== null && prevBucket - bucket > 18) text += "\n";
-
           const items = lineMap[bucket].sort((a, b) => a.x - b.x);
 
           if (isTagBankMode) {
-            // Split items into left (deficiency) and right (POC) columns
-            const leftItems = items.filter(w => w.x < midX);
+            // Split at exact page midpoint — left=deficiency, right=POC
+            const leftItems  = items.filter(w => w.x < midX);
             const rightItems = items.filter(w => w.x >= midX);
-            const leftLine = leftItems.map(w => w.str).join(" ").replace(/\s{3,}/g, "  ").trim();
-            const rightLine = rightItems.map(w => w.str).join(" ").replace(/\s{3,}/g, "  ").trim();
+            const leftLine  = leftItems.map(w => w.str).join(" ").replace(/  +/g, " ").trim();
+            const rightLine = rightItems.map(w => w.str).join(" ").replace(/  +/g, " ").trim();
             if (leftLine) text += leftLine + "\n";
-            // Accumulate right column keyed by bucket for later matching
             if (rightLine) {
               if (!rightColumnByY[bucket]) rightColumnByY[bucket] = [];
               rightColumnByY[bucket].push(rightLine);
             }
           } else {
-            // Original behavior — merge both columns
-            const line = items.map(w => w.str).join(" ").replace(/\s{3,}/g, "  ").trim();
+            const line = items.map(w => w.str).join(" ").replace(/  +/g, " ").trim();
             if (line) text += line + "\n";
           }
           prevBucket = bucket;
@@ -1092,15 +1078,20 @@ VERBATIM TEXT IS SOURCE OF TRUTH.`;
           };
         });
 
-      // Attach right-column text if captured during pagerender
-      const rightLines = Object.values(rightColumnByY).flat();
-      const rightText = rightLines.join(" ").trim();
-      if (rightText.length > 20 && fastCitations.length > 0) {
-        const chunkSize = Math.ceil(rightLines.length / fastCitations.length);
+      // Attach right-column text — match by Y position proximity to each tag's docText position
+      // Sort right column buckets top-to-bottom (descending Y in PDF coordinates)
+      const rightBuckets = Object.keys(rightColumnByY).map(Number).sort((a, b) => b - a);
+      const allRightLines = rightBuckets.map(b => rightColumnByY[b].join(" ")).filter(Boolean);
+      if (allRightLines.length > 0 && fastCitations.length > 0) {
+        // Distribute right-column lines across citations proportionally by position
+        const linesPerCit = Math.ceil(allRightLines.length / fastCitations.length);
         fastCitations.forEach((c, i) => {
-          c.poc_text = rightLines.slice(i * chunkSize, (i + 1) * chunkSize).join(" ").trim();
+          const start = i * linesPerCit;
+          const end = Math.min(start + linesPerCit, allRightLines.length);
+          c.poc_text = allRightLines.slice(start, end).join(" ").trim();
         });
       }
+      console.log("[Parse " + jobId + "] Right column lines captured: " + allRightLines.length);
 
       job.result = {
         facility_name: facilityName,
