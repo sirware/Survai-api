@@ -1078,20 +1078,92 @@ VERBATIM TEXT IS SOURCE OF TRUTH.`;
           };
         });
 
-      // Attach right-column text — match by Y position proximity to each tag's docText position
-      // Sort right column buckets top-to-bottom (descending Y in PDF coordinates)
+      // Parse right column into per-citation POC text + structured sections
       const rightBuckets = Object.keys(rightColumnByY).map(Number).sort((a, b) => b - a);
       const allRightLines = rightBuckets.map(b => rightColumnByY[b].join(" ")).filter(Boolean);
-      if (allRightLines.length > 0 && fastCitations.length > 0) {
-        // Distribute right-column lines across citations proportionally by position
-        const linesPerCit = Math.ceil(allRightLines.length / fastCitations.length);
+      const fullRightText = allRightLines.join(" ").trim();
+      console.log("[Parse " + jobId + "] Right column lines captured: " + allRightLines.length);
+
+      if (fullRightText.length > 20 && fastCitations.length > 0) {
+        // Split right column by F-tag markers — completed CMS-2567 has tag numbers on both sides
+        // Try splitting by tag numbers appearing in right column text
+        const tagNums = fastCitations.map(c => c.tag_number);
+
+        // Build a map of tag -> right column block by splitting on tag markers
+        const tagRightMap = {};
+        let remaining = fullRightText;
+
+        for (let i = 0; i < tagNums.length; i++) {
+          const tag = tagNums[i];
+          const nextTag = tagNums[i + 1];
+          const tagIdx = remaining.indexOf(tag);
+
+          if (tagIdx >= 0) {
+            const blockStart = tagIdx + tag.length;
+            const nextIdx = nextTag ? remaining.indexOf(nextTag, blockStart) : remaining.length;
+            const block = remaining.slice(blockStart, nextIdx > blockStart ? nextIdx : remaining.length).trim();
+            tagRightMap[tag] = block;
+            remaining = remaining.slice(nextIdx > blockStart ? nextIdx : remaining.length);
+          }
+        }
+
+        // If tag-based split found blocks, use them; otherwise fall back to proportional
+        const foundTagBlocks = Object.keys(tagRightMap).length;
+        console.log("[Parse " + jobId + "] Tag-based right blocks: " + foundTagBlocks);
+
         fastCitations.forEach((c, i) => {
-          const start = i * linesPerCit;
-          const end = Math.min(start + linesPerCit, allRightLines.length);
-          c.poc_text = allRightLines.slice(start, end).join(" ").trim();
+          let pocBlock = tagRightMap[c.tag_number] || "";
+
+          // Fallback: proportional distribution if tag-based split failed
+          if (!pocBlock && allRightLines.length > 0) {
+            const linesPerCit = Math.ceil(allRightLines.length / fastCitations.length);
+            pocBlock = allRightLines.slice(i * linesPerCit, (i + 1) * linesPerCit).join(" ").trim();
+          }
+
+          c.poc_text = pocBlock;
+
+          // Parse pocBlock into structured sections using numbered section headers
+          // Completed CMS-2567 POC sections are labeled: 1. Statement... 2. Root Cause... etc.
+          const sectionKeys = [
+            { key: "statement_of_deficiency",     patterns: ["1.", "1)", "statement of deficiency", "statement:"] },
+            { key: "root_cause_analysis",          patterns: ["2.", "2)", "root cause", "root cause analysis"] },
+            { key: "immediate_corrective_actions", patterns: ["3.", "3)", "immediate corrective", "corrective action", "a. corrective"] },
+            { key: "systemic_changes",             patterns: ["4.", "4)", "systemic changes", "systemic change", "c. systemic"] },
+            { key: "education_and_training",       patterns: ["5.", "5)", "education and training", "training"] },
+            { key: "policy_procedure_review",      patterns: ["6.", "6)", "policy and procedure", "policy review"] },
+            { key: "monitoring_and_auditing",      patterns: ["7.", "7)", "monitoring and auditing", "monitoring plan", "d. monitoring"] },
+            { key: "sustainability_plan",          patterns: ["8.", "8)", "sustainability plan", "sustainability"] },
+          ];
+
+          const sections = {};
+          const textLower = pocBlock.toLowerCase();
+
+          // Find positions of each section header in the text
+          const sectionPositions = [];
+          sectionKeys.forEach(sk => {
+            let bestPos = -1;
+            for (const pat of sk.patterns) {
+              const idx = textLower.indexOf(pat.toLowerCase());
+              if (idx >= 0 && (bestPos === -1 || idx < bestPos)) bestPos = idx;
+            }
+            if (bestPos >= 0) sectionPositions.push({ key: sk.key, pos: bestPos });
+          });
+          sectionPositions.sort((a, b) => a.pos - b.pos);
+
+          // Extract text between section markers
+          sectionPositions.forEach((sp, si) => {
+            const start = sp.pos;
+            const end = sectionPositions[si + 1] ? sectionPositions[si + 1].pos : pocBlock.length;
+            let text = pocBlock.slice(start, end).trim();
+            // Remove the header label from the beginning
+            text = text.replace(/^\d+[\.\)]\s*/m, "").replace(/^[A-H][\.\)]\s*/m, "").trim();
+            if (text.length > 10) sections[sp.key] = text;
+          });
+
+          // If we got at least some sections, use them; otherwise leave sections empty
+          if (Object.keys(sections).length > 0) c.sections = sections;
         });
       }
-      console.log("[Parse " + jobId + "] Right column lines captured: " + allRightLines.length);
 
       job.result = {
         facility_name: facilityName,
