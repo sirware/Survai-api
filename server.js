@@ -722,7 +722,15 @@ app.post("/api/parse-pdf", async (req, res) => {
             const rightItems = items.filter(w => w.x >= midX);
             const leftLine  = leftItems.map(w => w.str).join(" ").replace(/  +/g, " ").trim();
             const rightLine = rightItems.map(w => w.str).join(" ").replace(/  +/g, " ").trim();
-            if (leftLine) text += leftLine + "\n";
+            if (leftLine) {
+              text += leftLine + "\n";
+              // Track Y position of F/E/K tags so we can match to right column
+              const tagMatch = leftLine.match(/^(F\d{4}|E\d{4}|K\d{4})/);
+              if (tagMatch) {
+                if (!tagYPositions[tagMatch[1]]) tagYPositions[tagMatch[1]] = [];
+                tagYPositions[tagMatch[1]].push(bucket);
+              }
+            }
             if (rightLine) {
               if (!rightColumnByY[bucket]) rightColumnByY[bucket] = [];
               rightColumnByY[bucket].push(rightLine);
@@ -775,6 +783,7 @@ async function runParseJob(jobId, pdfBase64, facilityName, mode = "survey") {
   var surveyMetadata = {};
   var isTagBankMode = (mode === "tag-bank");
   var rightColumnByY = {};
+  var tagYPositions = {}; // maps tag -> [Y buckets where it appears in left column]
 
   try {
     // Step 1: Extract text from PDF using pdf-parse
@@ -1042,19 +1051,60 @@ VERBATIM TEXT IS SOURCE OF TRUTH.`;
       console.warn("[Parse " + jobId + "] Early metadata extraction failed:", metaErr.message);
     }
 
+    // ── Section parser helper ────────────────────────────────────────────────
+    function parseSectionsFromText(text) {
+      if (!text || text.length < 20) return {};
+      const defs = [
+        { key: "root_cause_analysis",           labels: ["root cause analysis", "root cause"] },
+        { key: "immediate_corrective_actions",   labels: ["immediate corrective action", "corrective action", "a. corrective", "a) corrective"] },
+        { key: "systemic_changes",               labels: ["systemic changes to prevent", "systemic change", "c. systemic", "c) systemic"] },
+        { key: "education_and_training",         labels: ["education and training", "b. education", "b) education"] },
+        { key: "policy_procedure_review",        labels: ["policy and procedure", "policy review", "policies and procedure"] },
+        { key: "monitoring_and_auditing",        labels: ["monitoring and auditing", "monitoring plan", "d. monitoring", "d) monitoring", "auditing plan"] },
+        { key: "sustainability_plan",            labels: ["sustainability plan", "sustainability"] },
+        { key: "projected_compliance_date",      labels: ["projected compliance date", "date of compliance", "compliance date", "projected date"] },
+      ];
+      const lower = text.toLowerCase();
+      const hits = [];
+      defs.forEach(d => {
+        d.labels.forEach(label => {
+          const idx = lower.indexOf(label);
+          if (idx >= 0) {
+            const existing = hits.findIndex(h => h.key === d.key);
+            if (existing >= 0) { if (idx < hits[existing].pos) hits[existing].pos = idx; }
+            else hits.push({ key: d.key, pos: idx });
+          }
+        });
+      });
+      hits.sort((a, b) => a.pos - b.pos);
+      if (hits.length === 0) {
+        // No section headers found — all content goes to corrective actions
+        return text.length > 20 ? { immediate_corrective_actions: text.trim() } : {};
+      }
+      const result = {};
+      hits.forEach((h, i) => {
+        const end = hits[i + 1] ? hits[i + 1].pos : text.length;
+        // Skip the header label itself — find where body starts
+        let bodyStart = h.pos;
+        const colonIdx = text.indexOf(":", bodyStart);
+        const nlIdx = text.indexOf("\n", bodyStart);
+        if (colonIdx >= 0 && colonIdx < bodyStart + 120) bodyStart = colonIdx + 1;
+        else if (nlIdx >= 0 && nlIdx < bodyStart + 120) bodyStart = nlIdx + 1;
+        const body = text.slice(bodyStart, end).replace(/^\s+/, "").trim();
+        if (body.length > 10) result[h.key] = body;
+      });
+      return result;
+    }
+
     // ── TAG BANK FAST PATH ─────────────────────────────────────────────────────
-    // For tag-bank mode: extract deficiency text (left col) + POC sections (right col).
-    // Strategy: parse full page text, find F-tags, then find SurvAI section headers
-    // to extract structured POC content per citation.
     if (mode === "tag-bank") {
       console.log("[Parse " + jobId + "] TAG-BANK fast path");
       job.status = "building";
 
-      // ── Step 1: Extract all F/E/K tags from left-column text ──────────────────
+      // ── Find all F/E/K tags in left-column text ────────────────────────────
       const tagPattern = /^(F\d{4}|E\d{4}|K\d{4})/gm;
       const tagMatches = [...docText.matchAll(tagPattern)];
       const tagPositions = tagMatches.map(m => ({ tag: m[1], index: m.index }));
-
       job.totalChunks = tagPositions.length;
       job.found = tagPositions.length;
 
@@ -1077,127 +1127,60 @@ VERBATIM TEXT IS SOURCE OF TRUTH.`;
           };
         });
 
-      // ── Step 2: Extract right-column POC text from rightColumnByY ─────────────
-      const rightBuckets = Object.keys(rightColumnByY).map(Number).sort((a, b) => b - a);
-      const allRightLines = rightBuckets.map(b => rightColumnByY[b].join(" ")).filter(Boolean);
-      const fullRightText = allRightLines.join(" ").trim();
-      console.log("[Parse " + jobId + "] Right column lines: " + allRightLines.length + " (" + fullRightText.length + " chars)");
+      console.log("[Parse " + jobId + "] Found " + fastCitations.length + " citations");
+      console.log("[Parse " + jobId + "] Right column buckets: " + Object.keys(rightColumnByY).length);
+      console.log("[Parse " + jobId + "] Tag Y positions tracked: " + Object.keys(tagYPositions).length);
 
-      // ── Step 3: Parse right column into per-citation structured sections ───────
-      // SurvAI POC exports use consistent section headers: 
-      // "1. Statement of Deficiency", "2. Root Cause Analysis", etc.
-      // Non-SurvAI completed forms use: "A. Corrective Action", or numbered similarly.
+      // ── Match right-column text to each tag by Y position ─────────────────
+      // Sort all right-column Y buckets descending (top of page = highest Y in PDF)
+      const allRightBuckets = Object.keys(rightColumnByY).map(Number).sort((a, b) => b - a);
 
-      const SECTION_PATTERNS = [
-        { key: "statement_of_deficiency",      labels: ["statement of deficiency", "statement of deficienc"] },
-        { key: "root_cause_analysis",           labels: ["root cause analysis", "root cause"] },
-        { key: "immediate_corrective_actions",  labels: ["immediate corrective action", "corrective action", "a. corrective"] },
-        { key: "systemic_changes",              labels: ["systemic changes", "systemic change", "c. systemic"] },
-        { key: "education_and_training",        labels: ["education and training", "b. education"] },
-        { key: "policy_procedure_review",       labels: ["policy and procedure", "policy review", "policies and procedure"] },
-        { key: "monitoring_and_auditing",       labels: ["monitoring and auditing", "monitoring plan", "d. monitoring", "auditing plan"] },
-        { key: "sustainability_plan",           labels: ["sustainability plan", "sustainability"] },
-        { key: "projected_compliance_date",     labels: ["projected compliance date", "date of compliance", "compliance date"] },
-      ];
+      if (allRightBuckets.length > 0 && fastCitations.length > 0) {
 
-      // Helper: parse a text blob into sections by scanning for known headers
-      function parseSections(text) {
-        if (!text || text.length < 30) return {};
-        const lower = text.toLowerCase();
-        const hits = [];
+        // Build sorted list of tag Y positions for boundary detection
+        // Each tag's right-column content runs from the tag's Y down to the next tag's Y
+        const tagYList = fastCitations
+          .map(c => ({
+            tag: c.tag_number,
+            // Use the highest Y bucket where this tag was seen (first occurrence = top of tag block)
+            topY: tagYPositions[c.tag_number] ? Math.max(...tagYPositions[c.tag_number]) : null,
+          }))
+          .filter(t => t.topY !== null)
+          .sort((a, b) => b.topY - a.topY); // sort top-to-bottom (descending Y)
 
-        SECTION_PATTERNS.forEach(sp => {
-          sp.labels.forEach(label => {
-            // Look for: number + period/paren + label OR just the label
-            const patterns = [
-              label,
-              "1. " + label, "2. " + label, "3. " + label, "4. " + label,
-              "5. " + label, "6. " + label, "7. " + label, "8. " + label, "9. " + label,
-              "a. " + label, "b. " + label, "c. " + label, "d. " + label,
-            ];
-            patterns.forEach(p => {
-              const idx = lower.indexOf(p.toLowerCase());
-              if (idx >= 0 && !hits.find(h => h.key === sp.key && h.pos <= idx)) {
-                // Only record first occurrence per section key
-                const existing = hits.findIndex(h => h.key === sp.key);
-                if (existing >= 0) {
-                  if (idx < hits[existing].pos) hits[existing].pos = idx;
-                } else {
-                  hits.push({ key: sp.key, pos: idx });
-                }
-              }
-            });
-          });
-        });
+        console.log("[Parse " + jobId + "] Tags with Y positions: " + tagYList.map(t=>t.tag+"@"+t.topY).join(", "));
 
-        hits.sort((a, b) => a.pos - b.pos);
-        const result = {};
-        hits.forEach((h, i) => {
-          const end = hits[i + 1] ? hits[i + 1].pos : text.length;
-          // Skip the header itself — find first newline or colon after the match pos
-          let bodyStart = h.pos;
-          const colonIdx = text.indexOf(":", bodyStart);
-          const newlineIdx = text.indexOf("\n", bodyStart);
-          if (colonIdx >= 0 && colonIdx < bodyStart + 80) bodyStart = colonIdx + 1;
-          else if (newlineIdx >= 0 && newlineIdx < bodyStart + 80) bodyStart = newlineIdx + 1;
-          const body = text.slice(bodyStart, end).replace(/^\s+/, "").trim();
-          if (body.length > 15) result[h.key] = body;
-        });
-        return result;
-      }
+        if (tagYList.length > 0) {
+          // For each tag, collect right-column buckets between this tag's Y and the next tag's Y
+          tagYList.forEach((tagInfo, i) => {
+            const topY = tagInfo.topY;
+            const bottomY = tagYList[i + 1] ? tagYList[i + 1].topY : -Infinity;
 
-      if (fullRightText.length > 50 && fastCitations.length > 0) {
-        // Try to split right column by tag number markers
-        const tagNums = fastCitations.map(c => c.tag_number);
-        const tagRightMap = {};
-        let searchFrom = 0;
+            // Right column lines for this tag = buckets between topY and bottomY
+            const tagRightBuckets = allRightBuckets.filter(b => b <= topY && b > bottomY);
+            const pocLines = tagRightBuckets.map(b => rightColumnByY[b].join(" ")).filter(Boolean);
+            const pocBlock = pocLines.join(" ").trim();
 
-        for (let i = 0; i < tagNums.length; i++) {
-          const tag = tagNums[i];
-          const tagIdx = fullRightText.indexOf(tag, searchFrom);
-          if (tagIdx >= 0) {
-            const blockStart = tagIdx + tag.length;
-            const nextTagIdx = tagNums[i + 1] ? fullRightText.indexOf(tagNums[i + 1], blockStart) : fullRightText.length;
-            const block = fullRightText.slice(blockStart, nextTagIdx > blockStart ? nextTagIdx : fullRightText.length).trim();
-            tagRightMap[tag] = block;
-            searchFrom = nextTagIdx > blockStart ? nextTagIdx : fullRightText.length;
-          }
-        }
-
-        const tagBlockCount = Object.keys(tagRightMap).length;
-        console.log("[Parse " + jobId + "] Tag-based right blocks found: " + tagBlockCount);
-
-        fastCitations.forEach((c, i) => {
-          let pocBlock = tagRightMap[c.tag_number] || "";
-
-          // Fallback: if no tag-based split, try to use the whole right column
-          // (works for single-citation documents)
-          if (!pocBlock && fastCitations.length === 1) {
-            pocBlock = fullRightText;
-          }
-
-          // Fallback 2: proportional split
-          if (!pocBlock && allRightLines.length > 0) {
-            const linesPerCit = Math.ceil(allRightLines.length / fastCitations.length);
-            pocBlock = allRightLines.slice(i * linesPerCit, (i + 1) * linesPerCit).join(" ").trim();
-          }
-
-          c.poc_text = pocBlock;
-
-          // Parse into structured sections
-          const sections = parseSections(pocBlock);
-          if (Object.keys(sections).length > 0) {
-            c.sections = sections;
-            console.log("[Parse " + jobId + "] " + c.tag_number + ": " + Object.keys(sections).length + " sections parsed");
-          } else {
-            // Last resort: put everything in immediate_corrective_actions
-            // so it at least shows up somewhere editable
-            if (pocBlock.length > 20) {
-              c.sections = { immediate_corrective_actions: pocBlock };
-              console.log("[Parse " + jobId + "] " + c.tag_number + ": fell back to single section (" + pocBlock.length + " chars)");
+            const cit = fastCitations.find(c => c.tag_number === tagInfo.tag);
+            if (cit && pocBlock.length > 10) {
+              cit.poc_text = pocBlock;
+              cit.sections = parseSectionsFromText(pocBlock);
+              console.log("[Parse " + jobId + "] " + tagInfo.tag + ": " + pocBlock.length + " chars, " + Object.keys(cit.sections).length + " sections");
             }
-          }
-        });
+          });
+        } else {
+          // Fallback: no Y position data — proportional split
+          console.log("[Parse " + jobId + "] No Y positions — falling back to proportional split");
+          const linesPerCit = Math.ceil(allRightBuckets.length / fastCitations.length);
+          fastCitations.forEach((c, i) => {
+            const buckets = allRightBuckets.slice(i * linesPerCit, (i + 1) * linesPerCit);
+            const pocBlock = buckets.map(b => rightColumnByY[b].join(" ")).join(" ").trim();
+            if (pocBlock.length > 10) {
+              c.poc_text = pocBlock;
+              c.sections = parseSectionsFromText(pocBlock);
+            }
+          });
+        }
       }
 
       job.result = {
