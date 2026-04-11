@@ -682,7 +682,10 @@ app.post("/api/parse-pdf", async (req, res) => {
     const pdfBuffer = Buffer.from(pdfBase64, "base64");
 
     // Custom page renderer — sorts items by Y then X to preserve column structure
-    // tag-bank mode: isTagBankMode and rightColumnByY declared at function scope above
+    // Declare BEFORE pagerender so they are assigned when pagerender closure runs
+    var isTagBankMode = (mode === "tag-bank");
+    var rightColumnByY = {};
+    var tagYPositions = {};
 
     const pagerender = (pageData) => {
       return pageData.getTextContent({
@@ -781,9 +784,6 @@ async function runParseJob(jobId, pdfBase64, facilityName, mode = "survey") {
 
   // Declare at function scope — must be available before try block and fast path
   var surveyMetadata = {};
-  var isTagBankMode = (mode === "tag-bank");
-  var rightColumnByY = {};
-  var tagYPositions = {}; // maps tag -> [Y buckets where it appears in left column]
 
   try {
     // Step 1: Extract text from PDF using pdf-parse
