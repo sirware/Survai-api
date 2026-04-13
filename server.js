@@ -423,7 +423,52 @@ function deadlineReminderHtml(facilityName, tags, surveyDate, complianceDate, da
   </table>
 </body></html>`;
 }
+// ─── Create Supabase Auth User ────────────────────────────────────────────────
+app.post("/api/auth/create-user", async (req, res) => {
+  const { email, password, name } = req.body;
+  if (!email || !password) return res.status(400).json({ error: "email and password required" });
+  try {
+    const { data, error } = await supabase.auth.admin.createUser({
+      email,
+      password,
+      email_confirm: true,
+      user_metadata: { name: name || "" },
+    });
+    if (error) {
+      // If user already exists in Auth, try updating their password instead
+      if (error.message?.includes("already been registered") || error.message?.includes("already exists")) {
+        const { data: list } = await supabase.auth.admin.listUsers();
+        const existing = list?.users?.find(u => u.email === email);
+        if (existing) {
+          await supabase.auth.admin.updateUserById(existing.id, { password });
+          return res.json({ success: true, updated: true });
+        }
+      }
+      return res.status(400).json({ error: error.message });
+    }
+    console.log(`Supabase Auth account created for ${email}`);
+    return res.json({ success: true, userId: data.user?.id });
+  } catch(e) {
+    console.error("create-user error:", e.message);
+    return res.status(500).json({ error: e.message });
+  }
+});
 
+// ─── Reset Supabase Auth Password ─────────────────────────────────────────────
+app.post("/api/auth/reset-password", async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: "email and password required" });
+  try {
+    const { data: list } = await supabase.auth.admin.listUsers();
+    const user = list?.users?.find(u => u.email === email);
+    if (!user) return res.status(404).json({ error: "User not found in Supabase Auth" });
+    const { error } = await supabase.auth.admin.updateUserById(user.id, { password });
+    if (error) return res.status(400).json({ error: error.message });
+    return res.json({ success: true });
+  } catch(e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
 // ─── Health Check ─────────────────────────────────────────────────────────────
 app.get("/", (req, res) => res.json({ status: "SurvAI API running on Bedrock" }));
 
