@@ -469,6 +469,62 @@ app.post("/api/auth/reset-password", async (req, res) => {
     return res.status(500).json({ error: e.message });
   }
 });
+// ─── Team Hub Welcome Email ───────────────────────────────────────────────────
+app.post("/api/email/team-hub-welcome", async (req, res) => {
+  const { name, email, tempPassword, role, existingAccount } = req.body;
+  if (!name || !email) return res.status(400).json({ error: "name and email required" });
+  const roleLabel = role === "admin" ? "Team Hub Admin" : "Team Hub Member";
+  const subject = existingAccount
+    ? "You've Been Added to the SurvAIHealth Team Hub"
+    : "Your SurvAIHealth Team Hub Access";
+  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"></head>
+<body style="margin:0;padding:0;background:#f1f5f9;font-family:Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f1f5f9;padding:40px 20px;">
+    <tr><td align="center">
+      <table width="600" cellpadding="0" cellspacing="0" style="background:white;border-radius:12px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.08);">
+        <tr><td style="background:linear-gradient(135deg,#0b3660,#0f4c81);padding:32px 40px;text-align:center;">
+          <div style="font-size:28px;font-weight:800;color:white;">SurvAI<span style="color:#38bdf8;">Health</span> <span style="font-size:16px;font-weight:400;color:#93c5fd;">Team Hub</span></div>
+          <div style="color:#93c5fd;font-size:13px;margin-top:6px;text-transform:uppercase;letter-spacing:0.1em;">Internal Staff Portal</div>
+        </td></tr>
+        <tr><td style="padding:40px;">
+          <h2 style="color:#0f172a;font-size:22px;margin:0 0 8px;">Hi ${name},</h2>
+          <p style="color:#475569;font-size:15px;line-height:1.6;margin:0 0 24px;">
+            ${existingAccount
+              ? "You've been granted access to the SurvAIHealth Team Hub — your internal workspace for SOPs, marketing materials, customer notes, and company resources."
+              : "Your SurvAIHealth Team Hub account has been created. This is your internal staff portal — separate from the client platform."}
+          </p>
+          <table width="100%" cellpadding="0" cellspacing="0" style="background:#f0f9ff;border:1px solid #bae6fd;border-radius:10px;margin-bottom:28px;">
+            <tr><td style="padding:24px;">
+              <div style="font-size:13px;font-weight:700;color:#0369a1;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:16px;">Your Team Hub Login</div>
+              <table width="100%">
+                <tr><td style="padding:8px 0;color:#64748b;font-size:14px;width:140px;">Portal URL:</td><td style="padding:8px 0;"><a href="https://employee.survaihealth.com" style="color:#0f4c81;font-weight:700;">employee.survaihealth.com</a></td></tr>
+                <tr><td style="padding:8px 0;color:#64748b;font-size:14px;">Username:</td><td style="padding:8px 0;color:#0f172a;font-size:14px;font-weight:600;">${email}</td></tr>
+                ${existingAccount
+                  ? `<tr><td style="padding:8px 0;color:#64748b;font-size:14px;">Password:</td><td style="padding:8px 0;color:#059669;font-size:14px;font-weight:600;">Use your existing SurvAIHealth password</td></tr>`
+                  : `<tr><td style="padding:8px 0;color:#64748b;font-size:14px;">Temp Password:</td><td style="padding:8px 0;"><span style="background:#0f4c81;color:white;padding:6px 14px;border-radius:6px;font-size:15px;font-weight:700;font-family:monospace;">${tempPassword}</span></td></tr>`}
+                <tr><td style="padding:8px 0;color:#64748b;font-size:14px;">Role:</td><td style="padding:8px 0;color:#0f172a;font-size:14px;font-weight:600;">${roleLabel}</td></tr>
+              </table>
+            </td></tr>
+          </table>
+          <div style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:14px 18px;margin-bottom:24px;color:#92400e;font-size:13px;">
+            <strong>Note:</strong> This is the internal Team Hub — not the client platform at app.survaihealth.com. Both use the same login credentials.
+          </div>
+          <table width="100%"><tr><td align="center" style="padding:8px 0 28px;">
+            <a href="https://employee.survaihealth.com" style="background:linear-gradient(135deg,#0f4c81,#0891b2);color:white;text-decoration:none;padding:14px 36px;border-radius:8px;font-size:15px;font-weight:700;display:inline-block;">Sign In to Team Hub →</a>
+          </td></tr></table>
+        </td></tr>
+        <tr><td style="background:#f8fafc;border-top:1px solid #e2e8f0;padding:20px 40px;text-align:center;">
+          <p style="color:#94a3b8;font-size:12px;margin:0;">SurvAIHealth LLC · Quality Care, Intelligently Managed</p>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body></html>`;
+  const text = `Hi ${name},\n\nYou now have access to the SurvAIHealth Team Hub.\n\nURL: https://employee.survaihealth.com\nUsername: ${email}\n${existingAccount ? "Password: Use your existing SurvAIHealth password" : `Temp Password: ${tempPassword}`}\n\nSurvAIHealth LLC`;
+  const result = await sendEmail(email, subject, html, text);
+  if (!result.success) return res.status(500).json({ error: "Failed to send email", detail: result.reason });
+  return res.json({ success: true });
+});
 // ─── Health Check ─────────────────────────────────────────────────────────────
 app.get("/", (req, res) => res.json({ status: "SurvAI API running on Bedrock" }));
 
