@@ -887,6 +887,7 @@ async function runParseJob(jobId, pdfBase64, facilityName, mode = "survey") {
   var surveyMetadata = {};
   var rightColumnByY = {};
   var tagYPositions = {};
+  var isTagBankMode = (mode === "tag-bank");
 
   try {
     // Step 1: Extract text from PDF using pdf-parse
