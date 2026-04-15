@@ -885,6 +885,8 @@ async function runParseJob(jobId, pdfBase64, facilityName, mode = "survey") {
 
   // Declare at function scope — must be available before try block and fast path
   var surveyMetadata = {};
+  var rightColumnByY = {};
+  var tagYPositions = {};
 
   try {
     // Step 1: Extract text from PDF using pdf-parse
