@@ -103,7 +103,7 @@ async function fetchProviderInfo(ccn) {
   const url = `${CMS_API_BASE}/${PROVIDER_INFO_DATASET}/0?conditions[0][property]=federal_provider_number&conditions[0][value]=${ccn}&conditions[0][operator]==&limit=1`;
 
   console.log(`[cmsIntegration] Fetching provider info for CCN ${ccn}`);
-  const res = await fetchWithTimeout(url, 30000);
+  const res = await fetchWithTimeout(url, 60000);
   if (!res.ok) {
     throw new Error(`CMS Provider API returned ${res.status}: ${res.statusText}`);
   }
@@ -175,7 +175,7 @@ async function fetchCitations(ccn) {
   while (hasMore && offset < 5000) { // hard cap at 5000 to prevent infinite loops
     const url = `${CMS_API_BASE}/${HEALTH_DEFICIENCIES_DATASET}/0?conditions[0][property]=federal_provider_number&conditions[0][value]=${ccn}&conditions[0][operator]==&limit=${pageSize}&offset=${offset}`;
 
-    const res = await fetchWithTimeout(url, 30000);
+    const res = await fetchWithTimeout(url, 60000);
     if (!res.ok) {
       throw new Error(`CMS Citations API returned ${res.status} at offset ${offset}`);
     }
@@ -543,6 +543,8 @@ function handleComputeStatePatterns(supabase) {
 
 // ─── Find facility by name (for the "Find on CMS" lookup tool) ─────────────
 // Returns up to 20 matches based on partial name + state filter.
+// Strategy: try CMS live first; on ANY failure (timeout, error, empty result),
+// fall back to Supabase cache so the user still gets useful results.
 function handleFindFacility(supabase) {
   return async (req, res) => {
     const { name, state } = req.query;
@@ -550,8 +552,11 @@ function handleFindFacility(supabase) {
       return res.status(400).json({ error: "Name required (min 3 chars)" });
     }
 
+    let liveResults = null;
+    let liveError = null;
+
+    // ─── Try CMS API live lookup ────────────────────────────────────────────
     try {
-      // Try CMS API first for live lookup
       const conditions = [
         `conditions[0][property]=provider_name&conditions[0][value]=${encodeURIComponent(name)}&conditions[0][operator]=contains`
       ];
@@ -560,11 +565,13 @@ function handleFindFacility(supabase) {
       }
       const url = `${CMS_API_BASE}/${PROVIDER_INFO_DATASET}/0?${conditions.join("&")}&limit=20`;
 
-      const apiRes = await fetchWithTimeout(url, 15000);
+      console.log(`[cmsIntegration] Find: ${url}`);
+      const apiRes = await fetchWithTimeout(url, 60000);  // 30s timeout (was 15s)
+
       if (apiRes.ok) {
         const data = await apiRes.json();
         const results = data.results || data.data || data;
-        const matches = (Array.isArray(results) ? results : []).map(row => ({
+        liveResults = (Array.isArray(results) ? results : []).map(row => ({
           ccn: getField(row, "federal_provider_number", "ccn"),
           provider_name: getField(row, "provider_name", "facility_name"),
           city: getField(row, "provider_city", "city"),
@@ -574,10 +581,21 @@ function handleFindFacility(supabase) {
           number_of_certified_beds: toInt(getField(row, "number_of_certified_beds"))
         })).filter(m => m.ccn);
 
-        return res.json({ matches, source: "live_api" });
+        if (liveResults.length > 0) {
+          return res.json({ matches: liveResults, source: "live_api" });
+        }
+        // If 0 matches, still try cache as a safety net
+      } else {
+        liveError = `CMS API returned ${apiRes.status}`;
       }
+    } catch (e) {
+      // Timeout, network error, abort — log and fall through to cache
+      liveError = e.message;
+      console.warn(`[cmsIntegration] Live CMS lookup failed: ${e.message}. Falling back to cache.`);
+    }
 
-      // Fallback to cached data if API unreachable
+    // ─── Fallback to Supabase cache ─────────────────────────────────────────
+    try {
       let q = supabase.from("cms_facility_data")
         .select("ccn, provider_name, city, state, zip, overall_rating, number_of_certified_beds")
         .ilike("provider_name", `%${name}%`)
@@ -585,10 +603,21 @@ function handleFindFacility(supabase) {
       if (state) q = q.eq("state", state);
 
       const { data, error } = await q;
-      if (error) return res.status(500).json({ error: error.message });
-      res.json({ matches: data || [], source: "cache" });
+      if (error) {
+        return res.status(500).json({
+          error: liveError ? `CMS live failed (${liveError}); cache also failed (${error.message})` : error.message
+        });
+      }
+
+      return res.json({
+        matches: data || [],
+        source: "cache",
+        live_error: liveError  // surface to client so we know if live was attempted
+      });
     } catch (e) {
-      res.status(500).json({ error: e.message });
+      return res.status(500).json({
+        error: liveError ? `CMS live failed (${liveError}); cache exception (${e.message})` : e.message
+      });
     }
   };
 }
