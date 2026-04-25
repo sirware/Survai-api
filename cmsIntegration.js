@@ -792,6 +792,163 @@ function handleStateStaffingMedians(supabase) {
   };
 }
 
+// ─── State Enforcement Outlook ─────────────────────────────────────────────
+// Aggregates citations across all facilities in a state for last 12 months.
+// Computes top-cited tags, citation density, fines, surge tags. Caches 24h.
+function handleStateEnforcement(supabase) {
+  return async (req, res) => {
+    try {
+      const stateRaw = String(req.params.state || "").toUpperCase().trim();
+      if (!/^[A-Z]{2}$/.test(stateRaw)) {
+        return res.status(400).json({ error: "Invalid state code (need 2 letters)" });
+      }
+
+      // ─── Cache check (< 24 hours old) ─────────────────────────────────────
+      const { data: cached } = await supabase
+        .from("state_enforcement_outlook")
+        .select("*")
+        .eq("state", stateRaw)
+        .maybeSingle();
+
+      if (cached && cached.computed_at) {
+        const ageMs = Date.now() - new Date(cached.computed_at).getTime();
+        if (ageMs < 24 * 60 * 60 * 1000) {
+          return res.json({ ...cached, source: "cache" });
+        }
+      }
+
+      console.log(`[cmsIntegration] Computing state enforcement outlook for ${stateRaw}`);
+
+      // ─── Compute date range (last 12 months) ──────────────────────────────
+      const today = new Date();
+      const periodEnd = today.toISOString().slice(0, 10);
+      const periodStartDate = new Date(today);
+      periodStartDate.setFullYear(today.getFullYear() - 1);
+      const periodStart = periodStartDate.toISOString().slice(0, 10);
+
+      // ─── Fetch citations in state for last 12 months (paginated) ──────────
+      const allCitations = [];
+      let offset = 0;
+      const pageSize = 1500;
+      let pages = 0;
+      const maxPages = 8; // Safety cap — 12K rows max
+
+      while (pages < maxPages) {
+        const sql = `[SELECT cms_certification_number_ccn,deficiency_tag_number,deficiency_description,survey_date,scope_severity_code FROM ${HEALTH_DEFICIENCIES_UUID}][WHERE state = "${stateRaw}" AND survey_date >= "${periodStart}"][LIMIT ${pageSize} OFFSET ${offset}]`;
+        const sqlRes = await sqlQuery(sql, 90000);
+        if (!sqlRes.ok) {
+          // Fall back to stale cache if available
+          if (cached) {
+            console.warn(`[cmsIntegration] State enforcement fetch failed (${sqlRes.status}), serving stale cache for ${stateRaw}`);
+            return res.json({ ...cached, source: "stale_cache", warning: `Live refresh failed (CMS returned ${sqlRes.status}), serving cached data from ${cached.computed_at}` });
+          }
+          return res.status(502).json({ error: `CMS SQL returned ${sqlRes.status}. Try again in a moment — CMS API is occasionally busy.` });
+        }
+        const rows = await sqlRes.json();
+        if (!Array.isArray(rows) || rows.length === 0) break;
+        allCitations.push(...rows);
+        if (rows.length < pageSize) break; // last page
+        offset += pageSize;
+        pages++;
+      }
+
+      console.log(`[cmsIntegration] ${stateRaw}: fetched ${allCitations.length} citations across ${pages + 1} pages`);
+
+      if (allCitations.length === 0) {
+        return res.status(404).json({ error: `No citations found in state ${stateRaw} for last 12 months` });
+      }
+
+      // ─── Aggregate ────────────────────────────────────────────────────────
+      const tagCounts = {};
+      const facilitySet = new Set();
+      const tagDescriptions = {};
+      const recentTagCounts = {};   // last 6 months
+      const priorTagCounts = {};    // 6-12 months ago
+      const sixMonthsAgo = new Date(today);
+      sixMonthsAgo.setMonth(today.getMonth() - 6);
+      const sixMonthsAgoStr = sixMonthsAgo.toISOString().slice(0, 10);
+
+      for (const c of allCitations) {
+        const tagRaw = c.deficiency_tag_number;
+        const tag = normalizeTag(tagRaw);
+        if (!tag) continue;
+        tagCounts[tag] = (tagCounts[tag] || 0) + 1;
+        if (!tagDescriptions[tag] && c.deficiency_description) tagDescriptions[tag] = c.deficiency_description;
+        if (c.cms_certification_number_ccn) facilitySet.add(c.cms_certification_number_ccn);
+        // Surge detection: split into two halves
+        if (c.survey_date >= sixMonthsAgoStr) {
+          recentTagCounts[tag] = (recentTagCounts[tag] || 0) + 1;
+        } else {
+          priorTagCounts[tag] = (priorTagCounts[tag] || 0) + 1;
+        }
+      }
+
+      // Top 10 by volume
+      const top_tags = Object.entries(tagCounts)
+        .map(([tag, count]) => ({
+          tag,
+          count,
+          pct: Math.round((count / allCitations.length) * 1000) / 10,
+          title: (tagDescriptions[tag] || "").slice(0, 80),
+        }))
+        .sort((a, b) => b.count - a.count)
+        .slice(0, 10);
+
+      // Surge tags: biggest jump from prior half to recent half (require >=20 recent for stability)
+      const surge_tags = Object.keys(recentTagCounts)
+        .filter(tag => recentTagCounts[tag] >= 20)
+        .map(tag => {
+          const recent = recentTagCounts[tag] || 0;
+          const prior = priorTagCounts[tag] || 0;
+          const change = prior === 0 ? recent * 100 : ((recent - prior) / prior) * 100;
+          return {
+            tag,
+            recent,
+            prior,
+            pct_change: Math.round(change * 10) / 10,
+            title: (tagDescriptions[tag] || "").slice(0, 80),
+          };
+        })
+        .sort((a, b) => b.pct_change - a.pct_change)
+        .slice(0, 5);
+
+      // ─── Aggregate fines from facility-level data already in our cache ────
+      let total_fines = 0;
+      try {
+        const { data: stateFacilities } = await supabase
+          .from("cms_facility_data")
+          .select("total_amount_of_fines_in_dollars")
+          .eq("state", stateRaw);
+        if (Array.isArray(stateFacilities)) {
+          total_fines = stateFacilities.reduce((sum, f) => sum + (parseFloat(f.total_amount_of_fines_in_dollars) || 0), 0);
+        }
+      } catch (e) {
+        console.warn(`[cmsIntegration] Could not aggregate fines for ${stateRaw}:`, e.message);
+      }
+
+      const result = {
+        state: stateRaw,
+        top_tags,
+        surge_tags,
+        total_citations: allCitations.length,
+        total_facilities: facilitySet.size,
+        citations_per_facility: facilitySet.size > 0 ? Math.round((allCitations.length / facilitySet.size) * 100) / 100 : 0,
+        total_fines: Math.round(total_fines * 100) / 100,
+        period_start: periodStart,
+        period_end: periodEnd,
+        computed_at: new Date().toISOString(),
+      };
+
+      await supabase.from("state_enforcement_outlook").upsert([result], { onConflict: "state" });
+      console.log(`[cmsIntegration] Cached enforcement outlook for ${stateRaw}: ${allCitations.length} citations, ${facilitySet.size} facilities`);
+      res.json({ ...result, source: "live" });
+    } catch (e) {
+      console.warn("[cmsIntegration] State enforcement error:", e.message);
+      res.status(500).json({ error: e.message });
+    }
+  };
+}
+
 module.exports = {
   fetchProviderInfo,
   fetchCitations,
@@ -806,6 +963,7 @@ module.exports = {
   handleFindFacility,
   handleSnapshotPrediction,
   handleStateStaffingMedians,
+  handleStateEnforcement,
   normalizeTag,
   getField,
 };
