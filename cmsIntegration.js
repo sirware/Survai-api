@@ -625,6 +625,58 @@ async function runWeeklyRefresh(supabase) {
   console.log("[cmsIntegration] Weekly refresh complete");
 }
 
+// ─── Snapshot handler — captures the PA brief for historical comparison ────
+// Frontend POSTs the brief object after rendering. We dedupe by (ccn, date)
+// so multiple views the same day count as one snapshot.
+function handleSnapshotPrediction(supabase) {
+  return async (req, res) => {
+    try {
+      const { cms_ccn, facility_id, focus_areas, watch_list, brief_full } = req.body || {};
+      if (!cms_ccn) {
+        return res.status(400).json({ error: "cms_ccn required" });
+      }
+
+      const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+
+      // Already snapshotted today? Skip silently.
+      const { data: existing } = await supabase
+        .from("prediction_snapshots")
+        .select("id")
+        .eq("cms_ccn", cms_ccn)
+        .eq("snapshot_date", today)
+        .maybeSingle();
+
+      if (existing) {
+        return res.json({ status: "already_snapshotted", id: existing.id, snapshot_date: today });
+      }
+
+      const { data, error } = await supabase
+        .from("prediction_snapshots")
+        .insert([{
+          cms_ccn,
+          facility_id: facility_id || null,
+          snapshot_date: today,
+          focus_areas: focus_areas || [],
+          watch_list: watch_list || [],
+          brief_full: brief_full || null,
+        }])
+        .select()
+        .single();
+
+      if (error) {
+        console.warn(`[cmsIntegration] Snapshot insert failed for ${cms_ccn}:`, error.message);
+        return res.status(500).json({ error: error.message });
+      }
+
+      console.log(`[cmsIntegration] Snapshot captured for CCN ${cms_ccn} (${focus_areas?.length || 0} focus + ${watch_list?.length || 0} watch)`);
+      res.json({ status: "snapshotted", id: data.id, snapshot_date: today });
+    } catch (e) {
+      console.warn("[cmsIntegration] Snapshot handler error:", e.message);
+      res.status(500).json({ error: e.message });
+    }
+  };
+}
+
 module.exports = {
   fetchProviderInfo,
   fetchCitations,
@@ -637,6 +689,7 @@ module.exports = {
   handleRefreshAll,
   handleComputeStatePatterns,
   handleFindFacility,
+  handleSnapshotPrediction,
   normalizeTag,
   getField,
 };
