@@ -525,28 +525,47 @@ function handleComputeStatePatterns(supabase) {
 // ─── Find facility by name (for "Find on CMS" lookup tool) ─────────────────
 function handleFindFacility(supabase) {
   return async (req, res) => {
-    const { name, state } = req.query;
-    if (!name || name.length < 3) {
-      return res.status(400).json({ error: "Name required (min 3 chars)" });
+    const { name, state, zip } = req.query;
+    // Either a name (3+ chars) OR a 5-digit ZIP must be provided
+    const hasName = name && String(name).length >= 3;
+    const hasZip = zip && /^\d{5}$/.test(String(zip).trim());
+    if (!hasName && !hasZip) {
+      return res.status(400).json({ error: "Provide either name (min 3 chars) or zip (5 digits)" });
     }
 
     let liveResults = null;
     let liveError = null;
 
-    // ─── Try CMS API live lookup via POST query ────────────────────────────
+    // ─── Try CMS API live lookup via SQL endpoint ──────────────────────────
     try {
-      // Build SQL with LIKE for partial-name search; escape any quotes in user input
-      const safeName = String(name).replace(/"/g, "");
+      const safeName = hasName ? String(name).toLowerCase() : null;
       const safeState = state ? String(state).replace(/"/g, "") : null;
-      const whereClauses = [`provider_name LIKE "%${safeName}%"`];
-      if (safeState) whereClauses.push(`state = "${safeState}"`);
-      const sql = `[SELECT cms_certification_number_ccn,provider_name,citytown,state,zip_code,overall_rating,number_of_certified_beds FROM ${PROVIDER_INFO_UUID}][WHERE ${whereClauses.join(" AND ")}][LIMIT 20]`;
+      const safeZip = hasZip ? String(zip).trim() : null;
 
-      console.log(`[cmsIntegration] Find: SQL query for "${name}"${state ? ` in ${state}` : ""}`);
+      // Build WHERE: ZIP wins if present (narrows to handful of facilities).
+      // Otherwise state-only narrow + JS post-filter on name.
+      let whereClause = "";
+      if (safeZip) {
+        whereClause = `[WHERE zip_code = "${safeZip}"]`;
+      } else if (safeState) {
+        whereClause = `[WHERE state = "${safeState}"]`;
+      }
+      const sql = `[SELECT cms_certification_number_ccn,provider_name,citytown,state,zip_code,overall_rating,number_of_certified_beds FROM ${PROVIDER_INFO_UUID}]${whereClause}[LIMIT 1000]`;
+
+      const queryDesc = safeZip ? `ZIP ${safeZip}` : `"${name}"${state ? ` in ${state}` : ""}`;
+      console.log(`[cmsIntegration] Find: SQL query for ${queryDesc}`);
       const apiRes = await sqlQuery(sql, 60000);
 
       if (apiRes.ok) {
-        const results = await apiRes.json();
+        const allResults = await apiRes.json();
+        // ZIP search returns the full set (already narrow). Name search post-filters by name.
+        const filtered = safeZip
+          ? (Array.isArray(allResults) ? allResults : [])
+          : (Array.isArray(allResults) ? allResults : []).filter(row => {
+              const n = (row.provider_name || "").toLowerCase();
+              return n.includes(safeName);
+            });
+        const results = filtered.slice(0, 50);
         liveResults = (Array.isArray(results) ? results : []).map(row => ({
           ccn: getField(row, "cms_certification_number_ccn", "federal_provider_number", "ccn"),
           provider_name: getField(row, "provider_name", "facility_name"),
