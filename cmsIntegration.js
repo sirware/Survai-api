@@ -119,7 +119,7 @@ async function fetchProviderInfo(ccn) {
 
   const res = await postQuery(PROVIDER_INFO_DATASET, {
     conditions: [
-      { property: "federal_provider_number", value: ccn, operator: "=" }
+      { property: "cms_certification_number_ccn", value: ccn, operator: "=" }
     ],
     limit: 1,
   });
@@ -144,11 +144,11 @@ async function fetchProviderInfo(ccn) {
     provider_name: getField(row, "provider_name", "facility_name", "name"),
     legal_business_name: getField(row, "legal_business_name", "legal_name"),
     address: getField(row, "provider_address", "address", "street_address"),
-    city: getField(row, "provider_city", "city"),
-    state: getField(row, "provider_state", "state"),
-    zip: getField(row, "provider_zip_code", "zip_code", "zip"),
-    phone: getField(row, "provider_phone_number", "phone_number", "phone"),
-    county: getField(row, "provider_county_name", "county_name", "county"),
+    city: getField(row, "citytown", "provider_city", "city"),
+    state: getField(row, "state", "provider_state"),
+    zip: getField(row, "zip_code", "provider_zip_code", "zip"),
+    phone: getField(row, "telephone_number", "provider_phone_number", "phone_number", "phone"),
+    county: getField(row, "countyparish", "provider_county_name", "county_name", "county"),
     overall_rating: toInt(getField(row, "overall_rating")),
     health_inspection_rating: toInt(getField(row, "health_inspection_rating", "rating_cycle_1_total_health_score")),
     staffing_rating: toInt(getField(row, "staffing_rating")),
@@ -156,7 +156,7 @@ async function fetchProviderInfo(ccn) {
     number_of_certified_beds: toInt(getField(row, "number_of_certified_beds", "certified_beds")),
     ownership_type: getField(row, "ownership_type"),
     provider_type: getField(row, "provider_type", "provider_subtype"),
-    in_hospital: toBool(getField(row, "located_in_hospital", "in_hospital")),
+    in_hospital: toBool(getField(row, "provider_resides_in_hospital", "located_in_hospital", "in_hospital")),
     in_ccrc: toBool(getField(row, "continuing_care_retirement_community", "in_ccrc")),
     legal_entity: getField(row, "legal_entity_type", "legal_entity"),
     resident_council: toBool(getField(row, "with_a_resident_council", "resident_council")),
@@ -189,7 +189,7 @@ async function fetchCitations(ccn) {
   while (hasMore && offset < 5000) {
     const res = await postQuery(HEALTH_DEFICIENCIES_DATASET, {
       conditions: [
-        { property: "federal_provider_number", value: ccn, operator: "=" }
+        { property: "cms_certification_number_ccn", value: ccn, operator: "=" }
       ],
       limit: pageSize,
       offset: offset,
@@ -518,7 +518,7 @@ function handleFindFacility(supabase) {
         { property: "provider_name", value: name, operator: "contains" }
       ];
       if (state) {
-        conditions.push({ property: "provider_state", value: state, operator: "=" });
+        conditions.push({ property: "state", value: state, operator: "=" });
       }
 
       console.log(`[cmsIntegration] Find: POST query for "${name}"${state ? ` in ${state}` : ""}`);
@@ -528,11 +528,11 @@ function handleFindFacility(supabase) {
         const data = await apiRes.json();
         const results = data.results || [];
         liveResults = (Array.isArray(results) ? results : []).map(row => ({
-          ccn: getField(row, "federal_provider_number", "ccn"),
+          ccn: getField(row, "cms_certification_number_ccn", "federal_provider_number", "ccn"),
           provider_name: getField(row, "provider_name", "facility_name"),
-          city: getField(row, "provider_city", "city"),
-          state: getField(row, "provider_state", "state"),
-          zip: getField(row, "provider_zip_code", "zip"),
+          city: getField(row, "citytown", "provider_city", "city"),
+          state: getField(row, "state", "provider_state"),
+          zip: getField(row, "zip_code", "provider_zip_code", "zip"),
           overall_rating: toInt(getField(row, "overall_rating")),
           number_of_certified_beds: toInt(getField(row, "number_of_certified_beds")),
         })).filter(m => m.ccn);
