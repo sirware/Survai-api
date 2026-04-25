@@ -18,7 +18,20 @@
 //   - Pagination handled — citations can be 100+ rows per facility
 // ═══════════════════════════════════════════════════════════════════════════
 
-const fetch = require("node-fetch");
+// Note: We use the built-in global fetch (Node 18+). No node-fetch package required.
+// Render runs Node 18+, so global fetch is always available.
+
+// ─── Helper: fetch with timeout ─────────────────────────────────────────────
+// Built-in fetch doesn't support a `timeout` option directly; we use AbortController.
+async function fetchWithTimeout(url, timeoutMs = 30000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 // ─── Dataset constants ──────────────────────────────────────────────────────
 const PROVIDER_INFO_DATASET = "4pq5-n9py";
@@ -90,7 +103,7 @@ async function fetchProviderInfo(ccn) {
   const url = `${CMS_API_BASE}/${PROVIDER_INFO_DATASET}/0?conditions[0][property]=federal_provider_number&conditions[0][value]=${ccn}&conditions[0][operator]==&limit=1`;
 
   console.log(`[cmsIntegration] Fetching provider info for CCN ${ccn}`);
-  const res = await fetch(url, { timeout: 30000 });
+  const res = await fetchWithTimeout(url, 30000);
   if (!res.ok) {
     throw new Error(`CMS Provider API returned ${res.status}: ${res.statusText}`);
   }
@@ -162,7 +175,7 @@ async function fetchCitations(ccn) {
   while (hasMore && offset < 5000) { // hard cap at 5000 to prevent infinite loops
     const url = `${CMS_API_BASE}/${HEALTH_DEFICIENCIES_DATASET}/0?conditions[0][property]=federal_provider_number&conditions[0][value]=${ccn}&conditions[0][operator]==&limit=${pageSize}&offset=${offset}`;
 
-    const res = await fetch(url, { timeout: 30000 });
+    const res = await fetchWithTimeout(url, 30000);
     if (!res.ok) {
       throw new Error(`CMS Citations API returned ${res.status} at offset ${offset}`);
     }
@@ -547,7 +560,7 @@ function handleFindFacility(supabase) {
       }
       const url = `${CMS_API_BASE}/${PROVIDER_INFO_DATASET}/0?${conditions.join("&")}&limit=20`;
 
-      const apiRes = await fetch(url, { timeout: 15000 });
+      const apiRes = await fetchWithTimeout(url, 15000);
       if (apiRes.ok) {
         const data = await apiRes.json();
         const results = data.results || data.data || data;
