@@ -30,7 +30,7 @@ const CMS_SQL_BASE = "https://data.cms.gov/provider-data/api/1/datastore/sql";
 
 // SQL query helper — uses CMS's SQL endpoint which is faster/lighter than POST query.
 // Includes 120s timeout + 1 retry. show_db_columns=true returns machine field names.
-async function sqlQuery(sqlText, timeoutMs = 120000, maxRetries = 1) {
+async function sqlQuery(sqlText, timeoutMs = 120000, maxRetries = 3) {
   const url = `${CMS_SQL_BASE}?query=${encodeURIComponent(sqlText)}&show_db_columns`;
   let lastError;
 
@@ -40,17 +40,27 @@ async function sqlQuery(sqlText, timeoutMs = 120000, maxRetries = 1) {
     try {
       const res = await fetch(url, { signal: controller.signal });
       clearTimeout(timer);
+      // Retry on 5xx server errors (CMS SQL endpoint occasionally returns 503 when busy)
+      if (res.status >= 500 && res.status < 600 && attempt < maxRetries) {
+        const backoffMs = 1500 * Math.pow(2, attempt); // 1.5s, 3s, 6s
+        console.warn(`[cmsIntegration] SQL attempt ${attempt + 1} got ${res.status}, retrying in ${backoffMs}ms...`);
+        await new Promise(r => setTimeout(r, backoffMs));
+        continue;
+      }
       return res;
     } catch (e) {
       clearTimeout(timer);
       lastError = e;
       if (attempt < maxRetries) {
-        console.warn(`[cmsIntegration] SQL attempt ${attempt + 1} failed (${e.message}), retrying in 2s...`);
-        await new Promise(r => setTimeout(r, 2000));
+        const backoffMs = 1500 * Math.pow(2, attempt);
+        console.warn(`[cmsIntegration] SQL attempt ${attempt + 1} failed (${e.message}), retrying in ${backoffMs}ms...`);
+        await new Promise(r => setTimeout(r, backoffMs));
       }
     }
   }
-  throw lastError;
+  if (lastError) throw lastError;
+  // Fell through with non-OK status that's not a 5xx — return the last response so caller can read .ok
+  throw new Error("SQL query failed after retries");
 }
 
 // ─── POST query helper with timeout + retry ────────────────────────────────
@@ -724,10 +734,15 @@ function handleStateStaffingMedians(supabase) {
 
       // Stale or missing — recompute from CMS
       console.log(`[cmsIntegration] Computing state staffing medians for ${stateRaw}`);
-      const sql = `[SELECT reported_total_nurse_staffing_hours_per_resident_per_day,reported_rn_staffing_hours_per_resident_per_day,reported_lpn_staffing_hours_per_resident_per_day,reported_nurse_aide_staffing_hours_per_resident_per_day,registered_nurse_hours_per_resident_per_day_on_the_weekend,total_nursing_staff_turnover,registered_nurse_turnover FROM ${PROVIDER_INFO_UUID}][WHERE state = "${stateRaw}"][LIMIT 2000]`;
+      const sql = `[SELECT reported_total_nurse_staffing_hours_per_resident_per_day,reported_rn_staffing_hours_per_resident_per_day,reported_lpn_staffing_hours_per_resident_per_day,reported_nurse_aide_staffing_hours_per_resident_per_day,registered_nurse_hours_per_resident_per_day_on_the_weekend,total_nursing_staff_turnover,registered_nurse_turnover FROM ${PROVIDER_INFO_UUID}][WHERE state = "${stateRaw}"][LIMIT 1500]`;
       const sqlRes = await sqlQuery(sql, 90000);
       if (!sqlRes.ok) {
-        return res.status(502).json({ error: `CMS SQL returned ${sqlRes.status}` });
+        // If we have stale cache data, return it instead of a hard error so user still sees comparison
+        if (cached) {
+          console.warn(`[cmsIntegration] State medians fetch failed (${sqlRes.status}), serving stale cache for ${stateRaw}`);
+          return res.json({ ...cached, source: "stale_cache", warning: `Live refresh failed (CMS returned ${sqlRes.status}), serving cached data from ${cached.computed_at}` });
+        }
+        return res.status(502).json({ error: `CMS SQL returned ${sqlRes.status}. Try again in a moment — CMS API is occasionally busy.` });
       }
       const rows = await sqlRes.json();
       if (!Array.isArray(rows) || rows.length === 0) {
