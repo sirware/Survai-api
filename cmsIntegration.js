@@ -200,6 +200,26 @@ async function fetchProviderInfo(ccn) {
     cms_data_last_updated: toDate(getField(row, "processing_date", "data_as_of_date")),
     fetched_at: new Date().toISOString(),
     source_api: "cms_provider_data_api",
+    // ─── Staffing metrics (nested JSONB to avoid schema migration) ─────────
+    // Used by Staffing Risk Forecast view
+    staffing_metrics: {
+      total_hprd:         toNumeric(getField(row, "reported_total_nurse_staffing_hours_per_resident_per_day")),
+      rn_hprd:            toNumeric(getField(row, "reported_rn_staffing_hours_per_resident_per_day")),
+      lpn_hprd:           toNumeric(getField(row, "reported_lpn_staffing_hours_per_resident_per_day")),
+      cna_hprd:           toNumeric(getField(row, "reported_nurse_aide_staffing_hours_per_resident_per_day")),
+      licensed_hprd:      toNumeric(getField(row, "reported_licensed_staffing_hours_per_resident_per_day")),
+      weekend_total:      toNumeric(getField(row, "total_number_of_nurse_staff_hours_per_resident_per_day_on_t_4a14")),
+      weekend_rn:         toNumeric(getField(row, "registered_nurse_hours_per_resident_per_day_on_the_weekend")),
+      pt_hprd:            toNumeric(getField(row, "reported_physical_therapist_staffing_hours_per_resident_per_day")),
+      nurse_turnover:     toNumeric(getField(row, "total_nursing_staff_turnover")),
+      rn_turnover:        toNumeric(getField(row, "registered_nurse_turnover")),
+      admin_turnover:     toInt(getField(row, "number_of_administrators_who_have_left_the_nursing_home")),
+      casemix_index:      toNumeric(getField(row, "nursing_casemix_index")),
+      casemix_index_ratio: toNumeric(getField(row, "nursing_casemix_index_ratio")),
+      adjusted_total:     toNumeric(getField(row, "adjusted_total_nurse_staffing_hours_per_resident_per_day")),
+      adjusted_rn:        toNumeric(getField(row, "adjusted_rn_staffing_hours_per_resident_per_day")),
+      adjusted_weekend:   toNumeric(getField(row, "adjusted_weekend_total_nurse_staffing_hours_per_resident_per_day")),
+    },
   };
 }
 
