@@ -23,6 +23,36 @@ const PROVIDER_INFO_DATASET = "4pq5-n9py";
 const HEALTH_DEFICIENCIES_DATASET = "r5ix-sfxw";
 const CMS_API_BASE = "https://data.cms.gov/provider-data/api/1/datastore/query";
 
+// SQL endpoint distribution UUIDs (verified from CMS metastore April 2026)
+const PROVIDER_INFO_UUID = "f87f2d80-0484-5229-8f0a-6398e5096de2";
+const HEALTH_DEFICIENCIES_UUID = "49d544f4-2559-52ba-af3c-73a567be1c2b";
+const CMS_SQL_BASE = "https://data.cms.gov/provider-data/api/1/datastore/sql";
+
+// SQL query helper — uses CMS's SQL endpoint which is faster/lighter than POST query.
+// Includes 120s timeout + 1 retry. show_db_columns=true returns machine field names.
+async function sqlQuery(sqlText, timeoutMs = 120000, maxRetries = 1) {
+  const url = `${CMS_SQL_BASE}?query=${encodeURIComponent(sqlText)}&show_db_columns`;
+  let lastError;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, { signal: controller.signal });
+      clearTimeout(timer);
+      return res;
+    } catch (e) {
+      clearTimeout(timer);
+      lastError = e;
+      if (attempt < maxRetries) {
+        console.warn(`[cmsIntegration] SQL attempt ${attempt + 1} failed (${e.message}), retrying in 2s...`);
+        await new Promise(r => setTimeout(r, 2000));
+      }
+    }
+  }
+  throw lastError;
+}
+
 // ─── POST query helper with timeout + retry ────────────────────────────────
 // Per CMS DKAN spec, query conditions go in a JSON body, not URL params.
 // 120s timeout — CMS API can be slow on cold-cache hits.
@@ -117,20 +147,16 @@ async function logRefresh(supabase, payload) {
 async function fetchProviderInfo(ccn) {
   console.log(`[cmsIntegration] Fetching provider info for CCN ${ccn}`);
 
-  const res = await postQuery(PROVIDER_INFO_DATASET, {
-    conditions: [
-      { property: "cms_certification_number_ccn", value: ccn, operator: "=" }
-    ],
-    limit: 1,
-  });
+  const sql = `[SELECT * FROM ${PROVIDER_INFO_UUID}][WHERE cms_certification_number_ccn = "${ccn}"][LIMIT 1]`;
+  const res = await sqlQuery(sql);
 
   if (!res.ok) {
     const errBody = await res.text().catch(() => "");
     throw new Error(`CMS Provider API returned ${res.status}: ${res.statusText}. ${errBody.slice(0, 200)}`);
   }
 
-  const data = await res.json();
-  const results = data.results || [];
+  // SQL endpoint returns array directly (not wrapped in {results: []})
+  const results = await res.json();
 
   if (!Array.isArray(results) || results.length === 0) {
     console.warn(`[cmsIntegration] No provider info found for CCN ${ccn}`);
@@ -187,20 +213,15 @@ async function fetchCitations(ccn) {
   console.log(`[cmsIntegration] Fetching citations for CCN ${ccn}`);
 
   while (hasMore && offset < 5000) {
-    const res = await postQuery(HEALTH_DEFICIENCIES_DATASET, {
-      conditions: [
-        { property: "cms_certification_number_ccn", value: ccn, operator: "=" }
-      ],
-      limit: pageSize,
-      offset: offset,
-    });
+    const sql = `[SELECT * FROM ${HEALTH_DEFICIENCIES_UUID}][WHERE cms_certification_number_ccn = "${ccn}"][LIMIT ${pageSize} OFFSET ${offset}]`;
+    const res = await sqlQuery(sql);
 
     if (!res.ok) {
       throw new Error(`CMS Citations API returned ${res.status} at offset ${offset}`);
     }
 
-    const data = await res.json();
-    const results = data.results || [];
+    // SQL endpoint returns array directly
+    const results = await res.json();
 
     if (!Array.isArray(results) || results.length === 0) {
       hasMore = false;
@@ -514,19 +535,18 @@ function handleFindFacility(supabase) {
 
     // ─── Try CMS API live lookup via POST query ────────────────────────────
     try {
-      const conditions = [
-        { property: "provider_name", value: name, operator: "contains" }
-      ];
-      if (state) {
-        conditions.push({ property: "state", value: state, operator: "=" });
-      }
+      // Build SQL with LIKE for partial-name search; escape any quotes in user input
+      const safeName = String(name).replace(/"/g, "");
+      const safeState = state ? String(state).replace(/"/g, "") : null;
+      const whereClauses = [`provider_name LIKE "%${safeName}%"`];
+      if (safeState) whereClauses.push(`state = "${safeState}"`);
+      const sql = `[SELECT cms_certification_number_ccn,provider_name,citytown,state,zip_code,overall_rating,number_of_certified_beds FROM ${PROVIDER_INFO_UUID}][WHERE ${whereClauses.join(" AND ")}][LIMIT 20]`;
 
-      console.log(`[cmsIntegration] Find: POST query for "${name}"${state ? ` in ${state}` : ""}`);
-      const apiRes = await postQuery(PROVIDER_INFO_DATASET, { conditions, limit: 20 }, 60000);
+      console.log(`[cmsIntegration] Find: SQL query for "${name}"${state ? ` in ${state}` : ""}`);
+      const apiRes = await sqlQuery(sql, 60000);
 
       if (apiRes.ok) {
-        const data = await apiRes.json();
-        const results = data.results || [];
+        const results = await apiRes.json();
         liveResults = (Array.isArray(results) ? results : []).map(row => ({
           ccn: getField(row, "cms_certification_number_ccn", "federal_provider_number", "ccn"),
           provider_name: getField(row, "provider_name", "facility_name"),
