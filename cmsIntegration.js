@@ -677,6 +677,86 @@ function handleSnapshotPrediction(supabase) {
   };
 }
 
+// ─── State staffing medians — for "vs your state" comparison ───────────────
+// Queries CMS SQL for all facilities in state, computes median for each
+// staffing metric, caches in Supabase 24h. Used by Staffing Risk Forecast.
+function handleStateStaffingMedians(supabase) {
+  return async (req, res) => {
+    try {
+      const stateRaw = String(req.params.state || "").toUpperCase().trim();
+      if (!/^[A-Z]{2}$/.test(stateRaw)) {
+        return res.status(400).json({ error: "Invalid state code (need 2 letters)" });
+      }
+
+      // Check cache (< 24 hours old)
+      const { data: cached } = await supabase
+        .from("state_staffing_medians")
+        .select("*")
+        .eq("state", stateRaw)
+        .maybeSingle();
+
+      if (cached && cached.computed_at) {
+        const ageMs = Date.now() - new Date(cached.computed_at).getTime();
+        if (ageMs < 24 * 60 * 60 * 1000) {
+          return res.json({ ...cached, source: "cache" });
+        }
+      }
+
+      // Stale or missing — recompute from CMS
+      console.log(`[cmsIntegration] Computing state staffing medians for ${stateRaw}`);
+      const sql = `[SELECT reported_total_nurse_staffing_hours_per_resident_per_day,reported_rn_staffing_hours_per_resident_per_day,reported_lpn_staffing_hours_per_resident_per_day,reported_nurse_aide_staffing_hours_per_resident_per_day,registered_nurse_hours_per_resident_per_day_on_the_weekend,total_nursing_staff_turnover,registered_nurse_turnover FROM ${PROVIDER_INFO_UUID}][WHERE state = "${stateRaw}"][LIMIT 2000]`;
+      const sqlRes = await sqlQuery(sql, 90000);
+      if (!sqlRes.ok) {
+        return res.status(502).json({ error: `CMS SQL returned ${sqlRes.status}` });
+      }
+      const rows = await sqlRes.json();
+      if (!Array.isArray(rows) || rows.length === 0) {
+        return res.status(404).json({ error: `No facilities found in state ${stateRaw}` });
+      }
+
+      // Median helper — strip non-numeric/zero values, sort, pick middle
+      const median = (key) => {
+        const vals = rows
+          .map(r => parseFloat(r[key]))
+          .filter(v => !isNaN(v) && v > 0)
+          .sort((a, b) => a - b);
+        if (vals.length === 0) return null;
+        const mid = Math.floor(vals.length / 2);
+        return vals.length % 2 ? vals[mid] : (vals[mid - 1] + vals[mid]) / 2;
+      };
+
+      const computed = {
+        state: stateRaw,
+        total_hprd: median("reported_total_nurse_staffing_hours_per_resident_per_day"),
+        rn_hprd: median("reported_rn_staffing_hours_per_resident_per_day"),
+        lpn_hprd: median("reported_lpn_staffing_hours_per_resident_per_day"),
+        cna_hprd: median("reported_nurse_aide_staffing_hours_per_resident_per_day"),
+        weekend_rn: median("registered_nurse_hours_per_resident_per_day_on_the_weekend"),
+        nurse_turnover: median("total_nursing_staff_turnover"),
+        rn_turnover: median("registered_nurse_turnover"),
+        facility_count: rows.length,
+        computed_at: new Date().toISOString(),
+      };
+
+      // Round for cleanliness
+      Object.keys(computed).forEach(k => {
+        if (typeof computed[k] === "number" && k !== "facility_count") {
+          computed[k] = Math.round(computed[k] * 100) / 100;
+        }
+      });
+
+      // Upsert to cache
+      await supabase.from("state_staffing_medians").upsert([computed], { onConflict: "state" });
+
+      console.log(`[cmsIntegration] Cached medians for ${stateRaw}: ${rows.length} facilities`);
+      res.json({ ...computed, source: "live" });
+    } catch (e) {
+      console.warn("[cmsIntegration] State medians error:", e.message);
+      res.status(500).json({ error: e.message });
+    }
+  };
+}
+
 module.exports = {
   fetchProviderInfo,
   fetchCitations,
@@ -690,6 +770,7 @@ module.exports = {
   handleComputeStatePatterns,
   handleFindFacility,
   handleSnapshotPrediction,
+  handleStateStaffingMedians,
   normalizeTag,
   getField,
 };
