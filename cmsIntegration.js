@@ -833,8 +833,10 @@ function handleStateEnforcement(supabase) {
       let pages = 0;
       const maxPages = 8; // Safety cap — 12K rows max
 
+      // CMS SQL doesn't support AND in WHERE clauses. Single-WHERE on state,
+      // post-filter dates in JS. Cap at 8 pages (12K rows) for safety.
       while (pages < maxPages) {
-        const sql = `[SELECT cms_certification_number_ccn,deficiency_tag_number,deficiency_description,survey_date,scope_severity_code FROM ${HEALTH_DEFICIENCIES_UUID}][WHERE state = "${stateRaw}" AND survey_date >= "${periodStart}"][LIMIT ${pageSize} OFFSET ${offset}]`;
+        const sql = `[SELECT cms_certification_number_ccn,deficiency_tag_number,deficiency_description,survey_date,scope_severity_code FROM ${HEALTH_DEFICIENCIES_UUID}][WHERE state = "${stateRaw}"][LIMIT ${pageSize} OFFSET ${offset}]`;
         const sqlRes = await sqlQuery(sql, 90000);
         if (!sqlRes.ok) {
           // Fall back to stale cache if available
@@ -852,10 +854,14 @@ function handleStateEnforcement(supabase) {
         pages++;
       }
 
-      console.log(`[cmsIntegration] ${stateRaw}: fetched ${allCitations.length} citations across ${pages + 1} pages`);
+      console.log(`[cmsIntegration] ${stateRaw}: fetched ${allCitations.length} raw citations across ${pages + 1} pages`);
 
-      if (allCitations.length === 0) {
-        return res.status(404).json({ error: `No citations found in state ${stateRaw} for last 12 months` });
+      // Post-filter to the 12-month window in JS
+      const recentCitations = allCitations.filter(c => c.survey_date && c.survey_date >= periodStart);
+      console.log(`[cmsIntegration] ${stateRaw}: ${recentCitations.length} citations in last 12 months`);
+
+      if (recentCitations.length === 0) {
+        return res.status(404).json({ error: `No recent citations found in state ${stateRaw} for last 12 months` });
       }
 
       // ─── Aggregate ────────────────────────────────────────────────────────
@@ -868,7 +874,7 @@ function handleStateEnforcement(supabase) {
       sixMonthsAgo.setMonth(today.getMonth() - 6);
       const sixMonthsAgoStr = sixMonthsAgo.toISOString().slice(0, 10);
 
-      for (const c of allCitations) {
+      for (const c of recentCitations) {
         const tagRaw = c.deficiency_tag_number;
         const tag = normalizeTag(tagRaw);
         if (!tag) continue;
@@ -888,7 +894,7 @@ function handleStateEnforcement(supabase) {
         .map(([tag, count]) => ({
           tag,
           count,
-          pct: Math.round((count / allCitations.length) * 1000) / 10,
+          pct: Math.round((count / recentCitations.length) * 1000) / 10,
           title: (tagDescriptions[tag] || "").slice(0, 80),
         }))
         .sort((a, b) => b.count - a.count)
@@ -930,7 +936,7 @@ function handleStateEnforcement(supabase) {
         state: stateRaw,
         top_tags,
         surge_tags,
-        total_citations: allCitations.length,
+        total_citations: recentCitations.length,
         total_facilities: facilitySet.size,
         citations_per_facility: facilitySet.size > 0 ? Math.round((allCitations.length / facilitySet.size) * 100) / 100 : 0,
         total_fines: Math.round(total_fines * 100) / 100,
@@ -940,7 +946,7 @@ function handleStateEnforcement(supabase) {
       };
 
       await supabase.from("state_enforcement_outlook").upsert([result], { onConflict: "state" });
-      console.log(`[cmsIntegration] Cached enforcement outlook for ${stateRaw}: ${allCitations.length} citations, ${facilitySet.size} facilities`);
+      console.log(`[cmsIntegration] Cached enforcement outlook for ${stateRaw}: ${recentCitations.length} citations, ${facilitySet.size} facilities`);
       res.json({ ...result, source: "live" });
     } catch (e) {
       console.warn("[cmsIntegration] State enforcement error:", e.message);
