@@ -1684,4 +1684,10 @@ app.post("/api/cms/state-patterns", cms.handleComputeStatePatterns(supabase));
 // Search CMS for a facility by name + state — used by the "Find on CMS" tool
 app.get("/api/cms/find", cms.handleFindFacility(supabase));
 
+// Snapshot a PA brief (one per facility per day) — feeds Historical Predictions vs Actual
+app.post("/api/cms/snapshot", express.json({ limit: "1mb" }), cms.handleSnapshotPrediction(supabase));
+
+// State-level staffing medians — used by Staffing Risk Forecast "vs State" toggle
+app.get("/api/cms/state-staffing-medians/:state", cms.handleStateStaffingMedians(supabase));
+
 app.listen(PORT, () => console.log(`SurvAI API running on port ${PORT}`));
