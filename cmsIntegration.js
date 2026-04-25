@@ -864,6 +864,22 @@ function handleStateEnforcement(supabase) {
         return res.status(404).json({ error: `No recent citations found in state ${stateRaw} for last 12 months` });
       }
 
+      // ─── Get total state facility count for honest density calculation ────
+      // Without this, citations-per-facility uses only facilities-with-citations
+      // as denominator, which inflates the ratio ~3-5x vs KFF national baseline.
+      let totalStateFacilities = 0;
+      try {
+        const fcSql = `[SELECT cms_certification_number_ccn FROM ${PROVIDER_INFO_UUID}][WHERE state = "${stateRaw}"][LIMIT 2000]`;
+        const fcRes = await sqlQuery(fcSql, 60000);
+        if (fcRes.ok) {
+          const fcRows = await fcRes.json();
+          if (Array.isArray(fcRows)) totalStateFacilities = fcRows.length;
+        }
+      } catch (e) {
+        console.warn(`[cmsIntegration] Could not fetch state facility count for ${stateRaw}:`, e.message);
+      }
+      console.log(`[cmsIntegration] ${stateRaw}: ${totalStateFacilities} total certified facilities`);
+
       // ─── Aggregate ────────────────────────────────────────────────────────
       const tagCounts = {};
       const facilitySet = new Set();
@@ -932,13 +948,17 @@ function handleStateEnforcement(supabase) {
         console.warn(`[cmsIntegration] Could not aggregate fines for ${stateRaw}:`, e.message);
       }
 
+      // Use total state facilities as denominator (matches KFF/CMS national baseline methodology)
+      // Falls back to facilitySet.size if state facility count fetch failed
+      const denominator = totalStateFacilities > 0 ? totalStateFacilities : facilitySet.size;
       const result = {
         state: stateRaw,
         top_tags,
         surge_tags,
         total_citations: recentCitations.length,
-        total_facilities: facilitySet.size,
-        citations_per_facility: facilitySet.size > 0 ? Math.round((allCitations.length / facilitySet.size) * 100) / 100 : 0,
+        total_facilities: denominator,                                  // total certified in state
+        total_facilities_with_citations: facilitySet.size,              // subset that had recent citations
+        citations_per_facility: denominator > 0 ? Math.round((recentCitations.length / denominator) * 100) / 100 : 0,
         total_fines: Math.round(total_fines * 100) / 100,
         period_start: periodStart,
         period_end: periodEnd,
