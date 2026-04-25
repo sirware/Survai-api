@@ -23,6 +23,7 @@ const BEDROCK_MODEL_ID = "us.anthropic.claude-sonnet-4-5-20250929-v1:0";
 const { createClient } = require("@supabase/supabase-js");
 const pdfParse = require("pdf-parse");
 const { parseCMS2567 } = require("./cms2567Parser");
+const cms = require("./cmsIntegration");
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SECRET_KEY  // service role — bypasses RLS for server writes
@@ -1662,5 +1663,25 @@ app.post("/api/batch/cancel/:batchId", (req, res) => {
   console.log(`[Batch ${job.batchId}] Cancelled by client`);
   return res.status(200).json({ success: true });
 });
+
+// ─── CMS Predictive Integration Routes ────────────────────────────────────────
+// Powers the Predictive Analytics tab. Fetches CMS Provider Data Catalog data
+// for facilities by CCN, caches in Supabase, and serves the cached data to
+// the frontend's risk scoring engine.
+
+// Get cached facility data + citations for a CCN
+app.get("/api/cms/facility/:ccn", cms.handleGetFacility(supabase));
+
+// Refresh one facility — fetches fresh from CMS API and updates cache
+app.post("/api/cms/refresh/:ccn", cms.handleRefreshFacility(supabase));
+
+// Refresh all facilities that have a cms_ccn set in the facilities table
+app.post("/api/cms/refresh-all", cms.handleRefreshAll(supabase));
+
+// Recompute state-level F-tag patterns (run after a refresh-all)
+app.post("/api/cms/state-patterns", cms.handleComputeStatePatterns(supabase));
+
+// Search CMS for a facility by name + state — used by the "Find on CMS" tool
+app.get("/api/cms/find", cms.handleFindFacility(supabase));
 
 app.listen(PORT, () => console.log(`SurvAI API running on port ${PORT}`));
