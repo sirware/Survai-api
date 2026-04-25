@@ -1690,4 +1690,7 @@ app.post("/api/cms/snapshot", express.json({ limit: "1mb" }), cms.handleSnapshot
 // State-level staffing medians — used by Staffing Risk Forecast "vs State" toggle
 app.get("/api/cms/state-staffing-medians/:state", cms.handleStateStaffingMedians(supabase));
 
+// State Enforcement Outlook — top-cited tags, density, surge in your state
+app.get("/api/cms/state-enforcement/:state", cms.handleStateEnforcement(supabase));
+
 app.listen(PORT, () => console.log(`SurvAI API running on port ${PORT}`));
