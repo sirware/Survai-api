@@ -229,18 +229,38 @@ async function runBatchJob(batchId, citations, facility, settings, userId, facil
     job.completedPips = results.filter(Boolean);
   };
 
-  // Run with concurrency limit
+  // Run with concurrency limit — workers check job.status every iteration so
+  // a cancel from /api/batch/cancel/:batchId stops new citations from starting.
+  // In-flight citations finish (we never abort an active Claude API call) but
+  // remaining queue items are abandoned cleanly.
   const workers = Array(Math.min(CONCURRENCY, queue.length)).fill(null).map(async () => {
     while (queue.length > 0) {
+      // ─── Cancellation gate ───────────────────────────────────────────────
+      // Re-fetch job from the map each iteration. The cancel endpoint sets
+      // job.status = "cancelled" — when we see that, drain the queue without
+      // processing anything else.
+      const currentJob = batchJobs.get(batchId);
+      if (!currentJob || currentJob.status === "cancelled") {
+        console.log(`[Batch ${batchId}] Worker exiting — job cancelled`);
+        return;
+      }
       const item = queue.shift();
       if (item) await processOne(item);
     }
   });
 
   await Promise.all(workers);
-  job.status = "complete";
-  job.completedAt = new Date().toISOString();
-  console.log(`[Batch ${batchId}] Complete — ${job.done} done, ${job.failed} failed`);
+
+  // Don't overwrite a "cancelled" status with "complete"
+  const finalJob = batchJobs.get(batchId);
+  if (finalJob && finalJob.status !== "cancelled") {
+    finalJob.status = "complete";
+    finalJob.completedAt = new Date().toISOString();
+    console.log(`[Batch ${batchId}] Complete — ${finalJob.done} done, ${finalJob.failed} failed`);
+  } else if (finalJob) {
+    finalJob.completedAt = new Date().toISOString();
+    console.log(`[Batch ${batchId}] Cancelled — saved ${finalJob.done} done, ${finalJob.failed} failed before stopping`);
+  }
 }
 
 // ─── SendGrid Email Helper ────────────────────────────────────────────────────
@@ -1306,10 +1326,34 @@ VERBATIM TEXT IS SOURCE OF TRUTH.`;
     if (job.disableEnrichment) {
       console.log("[Parse " + jobId + "] AI enrichment DISABLED by admin setting");
     }
+
+    // ─── Cancellation-aware AI extractor ───────────────────────────────────
+    // Wrap the extractor so it checks job.status before each per-citation
+    // enrichment call. parseCMS2567 calls this for every citation block;
+    // throwing CANCELLED_BY_CLIENT bails out cleanly and the catch below
+    // logs the cancel without treating it as a real error.
+    const wrappedExtractor = job.disableEnrichment ? null : async (...args) => {
+      const j = parseJobs.get(jobId);
+      if (!j || j.status === "cancelled") {
+        throw new Error("CANCELLED_BY_CLIENT");
+      }
+      return aiExtractor(...args);
+    };
+
     const parseResult = await parseCMS2567(docText, {
-      aiExtractor: job.disableEnrichment ? null : aiExtractor,
+      aiExtractor: wrappedExtractor,
       concurrency: 4,
     });
+
+    // After parse completes, check one more time before saving result —
+    // covers the case where cancel arrives after extraction but before save.
+    {
+      const postParseJob = parseJobs.get(jobId);
+      if (!postParseJob || postParseJob.status === "cancelled") {
+        console.log("[Parse " + jobId + "] Cancelled after extraction — discarding result");
+        return;
+      }
+    }
 
     job.totalChunks = parseResult.stats.candidate_count;
     job.currentChunk = parseResult.stats.candidate_count;
@@ -1552,6 +1596,14 @@ VERBATIM TEXT IS SOURCE OF TRUTH.`;
     console.log("[Parse " + jobId + "] Complete — " + deduped.length + " citations");
 
   } catch(err) {
+    // Distinguish client cancellation from real errors — cancelled jobs
+    // should remain in "cancelled" status, not flip to "error"
+    if (err?.message === "CANCELLED_BY_CLIENT") {
+      console.log("[Parse " + jobId + "] Cancelled mid-extraction by client");
+      const j = parseJobs.get(jobId);
+      if (j && j.status !== "cancelled") j.status = "cancelled";
+      return;
+    }
     console.error("[Parse " + jobId + "] Fatal:", err.message);
     job.status = "error";
     job.error = err.message;
