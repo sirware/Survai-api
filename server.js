@@ -1757,47 +1757,65 @@ app.get("/api/cms/survey-radar", async (req, res) => {
     cutoff.setDate(cutoff.getDate() - parseInt(days || "30", 10));
     const cutoffStr = cutoff.toISOString().split("T")[0];
 
-    // ─── Use the SAME pattern as cmsIntegration's working sqlQuery() ───
-    // Three things that broke the previous implementation, now fixed:
-    //   1. Path: /datastore/sql (was /sql — missing /datastore/)
-    //   2. Dataset identifier: UUID (was the slug r5ix-sfxw — slugs don't
-    //      work with the SQL endpoint, only with /datastore/query)
-    //   3. Column name: state (was provstate — not a real column)
+    // ─── Hard-learned constraints from CMS DKAN SQL endpoint ───
+    //   1. Path: /datastore/sql (not /sql)
+    //   2. Dataset: UUID, not slug
+    //   3. ONE filter per WHERE bracket — no AND, no compound conditions
+    //   4. LIMIT max is 1500 (not 2000, not 5000)
+    //   5. Bracket syntax: [SELECT...][WHERE x = "y"][LIMIT n OFFSET m]
     //
-    // SQL bracket syntax is the DKAN convention: [SELECT...][WHERE...][LIMIT...]
+    // Approach: filter by state server-side (one WHERE), paginate up to 1500
+    // rows per page, date-filter in JS after fetch. State-filtered LA queries
+    // typically return <2000 rows total so 2 pages max.
     const HEALTH_DEFICIENCIES_UUID = "49d544f4-2559-52ba-af3c-73a567be1c2b";
-    const stateClause = (state && state !== "all")
-      ? `[WHERE state = "${state.replace(/"/g, '""')}" AND survey_date >= "${cutoffStr}"]`
-      : `[WHERE survey_date >= "${cutoffStr}"]`;
-    const sql = `[SELECT * FROM ${HEALTH_DEFICIENCIES_UUID}]${stateClause}[LIMIT 2000]`;
-    const url = `https://data.cms.gov/provider-data/api/1/datastore/sql?query=${encodeURIComponent(sql)}&show_db_columns`;
+    const PAGE_SIZE = 1500;
+    const MAX_PAGES = 4; // safety cap — 6000 rows max
+    const wantState = (state && state !== "all") ? state.replace(/"/g, '""') : null;
 
-    console.log("[SurveyRadar] SQL:", sql);
+    const fetchPage = (offset) => new Promise((resolve, reject) => {
+      const whereClause = wantState ? `[WHERE state = "${wantState}"]` : "";
+      const sql = `[SELECT * FROM ${HEALTH_DEFICIENCIES_UUID}]${whereClause}[LIMIT ${PAGE_SIZE} OFFSET ${offset}]`;
+      const url = `https://data.cms.gov/provider-data/api/1/datastore/sql?query=${encodeURIComponent(sql)}&show_db_columns`;
+      console.log(`[SurveyRadar] page offset=${offset}:`, sql);
 
-    const results = await new Promise((resolve, reject) => {
       https.get(url, {
-        headers: {
-          "Accept": "application/json",
-          "User-Agent": "Node/SurvAIHealth",
-        },
+        headers: { "Accept": "application/json", "User-Agent": "Node/SurvAIHealth" },
       }, (r) => {
         let buf = "";
         r.on("data", chunk => buf += chunk);
         r.on("end", () => {
-          console.log("[SurveyRadar] status:", r.statusCode, "len:", buf.length, "preview:", buf.slice(0, 250));
-          if (r.statusCode !== 200) return reject(new Error(`CMS HTTP ${r.statusCode}: ${buf.slice(0, 300)}`));
+          if (r.statusCode !== 200) {
+            console.error(`[SurveyRadar] CMS ${r.statusCode}: ${buf.slice(0, 250)}`);
+            return reject(new Error(`CMS HTTP ${r.statusCode}: ${buf.slice(0, 250)}`));
+          }
           try { resolve(JSON.parse(buf)); }
-          catch(e) { reject(new Error("JSON parse error: " + buf.slice(0, 300))); }
+          catch(e) { reject(new Error("JSON parse error: " + buf.slice(0, 250))); }
         });
         r.on("error", reject);
       }).on("error", reject);
     });
 
-    // SQL endpoint returns array directly (not wrapped in {results:[]})
-    const arr = Array.isArray(results) ? results : (results.results || []);
-    console.log(`[SurveyRadar] ${arr.length} rows returned for state=${state || "all"} since ${cutoffStr}`);
+    // Paginate
+    const allRows = [];
+    for (let page = 0; page < MAX_PAGES; page++) {
+      const offset = page * PAGE_SIZE;
+      const pageRows = await fetchPage(offset);
+      const rows = Array.isArray(pageRows) ? pageRows : (pageRows.results || []);
+      console.log(`[SurveyRadar] page ${page + 1}: ${rows.length} rows`);
+      if (rows.length === 0) break;
+      allRows.push(...rows);
+      if (rows.length < PAGE_SIZE) break; // last page
+    }
 
-    return res.json({ results: arr, count: arr.length });
+    // Date-filter in JS (DKAN bracket SQL can't AND multiple conditions)
+    const filtered = allRows.filter(row => {
+      const sd = row.survey_date || "";
+      return sd >= cutoffStr;
+    });
+
+    console.log(`[SurveyRadar] state=${state || "all"} fetched=${allRows.length} after-date=${filtered.length} (cutoff=${cutoffStr})`);
+
+    return res.json({ results: filtered, count: filtered.length });
 
   } catch (e) {
     console.error("[SurveyRadar] Error:", e.message);
