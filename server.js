@@ -1759,14 +1759,14 @@ app.get("/api/cms/survey-radar", async (req, res) => {
 
     // ─── Hard-learned constraints from CMS DKAN SQL endpoint ───
     //   1. Path: /datastore/sql (not /sql)
-    //   2. Dataset: UUID, not slug
+    //   2. Dataset: UUID, not slug r5ix-sfxw
     //   3. ONE filter per WHERE bracket — no AND, no compound conditions
-    //   4. LIMIT max is 1500 (not 2000, not 5000)
+    //   4. LIMIT max is 1500
     //   5. Bracket syntax: [SELECT...][WHERE x = "y"][LIMIT n OFFSET m]
     //
     // Approach: filter by state server-side (one WHERE), paginate up to 1500
-    // rows per page, date-filter in JS after fetch. State-filtered LA queries
-    // typically return <2000 rows total so 2 pages max.
+    // rows per page, then date-filter in JS after fetch. Same pattern as
+    // cmsIntegration.js which is proven working.
     const HEALTH_DEFICIENCIES_UUID = "49d544f4-2559-52ba-af3c-73a567be1c2b";
     const PAGE_SIZE = 1500;
     const MAX_PAGES = 4; // safety cap — 6000 rows max
