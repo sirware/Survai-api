@@ -1757,13 +1757,25 @@ app.get("/api/cms/survey-radar", async (req, res) => {
     cutoff.setDate(cutoff.getDate() - parseInt(days || "30", 10));
     const cutoffStr = cutoff.toISOString().split("T")[0];
 
-    // ─── Why /datastore/query (POST), not /datastore/sql ───────────────
-    // The SQL endpoint requires a UUID that CMS rotates when datasets are
-    // republished, which broke us with "No datastore storage found for..."
-    // The /datastore/query endpoint accepts the stable slug "r5ix-sfxw"
-    // directly. Also requires LIMIT ≤ 1500 and conditions[] in JSON body.
+    // ─── Why Inspection Dates (svdt-c123), not Health Deficiencies ──────
+    // The original code used r5ix-sfxw (Health Deficiencies) which is the
+    // wrong dataset for "who got surveyed recently." Two reasons:
     //
-    // We filter by state server-side, paginate, then date-filter in JS.
+    //   1. r5ix-sfxw only contains rows when a survey produced citations.
+    //      Facilities surveyed with zero findings are invisible.
+    //   2. CMS publishes citations 2-3 months after the survey date.
+    //      Recent surveys don't have citations posted yet.
+    //
+    // svdt-c123 (Inspection Dates) is the right feed:
+    //   - One row per inspection (standard, complaint, infection control)
+    //   - Dates included whether or not citations were issued
+    //   - Lower publication lag — appears days/weeks after, not months
+    //
+    // Endpoint constraints (same as before):
+    //   - Path: /datastore/query (slug stable across CMS refreshes)
+    //   - LIMIT max 1500
+    //   - One filter per conditions[] entry, no compound clauses
+    //   - Date filtering done in JS post-fetch
     const PAGE_SIZE = 1500;
     const MAX_PAGES = 4;
     const wantState = (state && state !== "all") ? state.toUpperCase() : null;
@@ -1775,7 +1787,7 @@ app.get("/api/cms/survey-radar", async (req, res) => {
         conditions: wantState ? [{ property: "state", value: wantState, operator: "=" }] : [],
       };
       const body = JSON.stringify(queryBody);
-      const url = "https://data.cms.gov/provider-data/api/1/datastore/query/r5ix-sfxw/0";
+      const url = "https://data.cms.gov/provider-data/api/1/datastore/query/svdt-c123/0";
       console.log(`[SurveyRadar] POST offset=${offset} state=${wantState || "all"}`);
 
       const r2 = https.request(url, {
@@ -1816,9 +1828,9 @@ app.get("/api/cms/survey-radar", async (req, res) => {
       if (rows.length < PAGE_SIZE) break;
     }
 
-    // Date-filter in JS — survey_date stored as YYYY-MM-DD so string compare works
+    // Date-filter in JS — Inspection Dates uses survey_date column
     const filtered = allRows.filter(row => {
-      const sd = row.survey_date || row.surveydate || "";
+      const sd = row.survey_date || row.surveydate || row.inspection_date || "";
       return sd >= cutoffStr;
     });
 
