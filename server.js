@@ -1754,23 +1754,29 @@ app.get("/api/cms/survey-radar", async (req, res) => {
 
   try {
     const cutoff = new Date();
-    cutoff.setDate(cutoff.getDate() - parseInt(days || "30", 10));
+    cutoff.setDate(cutoff.getDate() - parseInt(days || "90", 10));
     const cutoffStr = cutoff.toISOString().split("T")[0];
 
-    // ─── Simple version ──────────────────────────────────────────────
-    // Pulls recent inspections from svdt-c123 (Inspection Dates) and
-    // returns whatever columns CMS gives us. No state filter, no join
-    // with provider info — Inspection Dates only has these 5 columns:
-    //   cms_certification_number_ccn, survey_date, type_of_survey,
-    //   survey_cycle, processing_date
-    // The frontend can group/sort/display however it wants.
+    // ─── Architecture ────────────────────────────────────────────────
+    // Step 1: Pull inspections from svdt-c123 (Inspection Dates).
+    //   Has only: ccn, survey_date, type_of_survey, survey_cycle,
+    //   processing_date. No facility name.
+    //
+    // Step 2: For each unique CCN we found, look it up in the cached
+    //   provider info map (4pq5-n9py = Provider Information). Has:
+    //   provider_name, citytown, state, zip_code, ownership_type,
+    //   number_of_certified_beds, overall_rating, etc.
+    //
+    // Provider Information is ~14K rows, refreshed monthly. We fetch
+    // it once per cold start and cache for 1 hour to avoid repeating
+    // 10+ paginated queries on every radar load.
     const PAGE_SIZE = 1500;
-    const MAX_PAGES = 8; // 12000 rows max — covers ~6 months nationally
+    const MAX_INSPECTION_PAGES = 8;  // 12K rows max — ~6mo nationally
 
-    const fetchPage = (offset) => new Promise((resolve, reject) => {
+    const fetchCmsPage = (slug, offset) => new Promise((resolve, reject) => {
       const queryBody = { limit: PAGE_SIZE, offset, conditions: [] };
       const body = JSON.stringify(queryBody);
-      const url = "https://data.cms.gov/provider-data/api/1/datastore/query/svdt-c123/0";
+      const url = `https://data.cms.gov/provider-data/api/1/datastore/query/${slug}/0`;
 
       const r2 = https.request(url, {
         method: "POST",
@@ -1785,7 +1791,7 @@ app.get("/api/cms/survey-radar", async (req, res) => {
         r.on("data", chunk => buf += chunk);
         r.on("end", () => {
           if (r.statusCode !== 200) {
-            console.error(`[SurveyRadar] CMS ${r.statusCode}: ${buf.slice(0, 280)}`);
+            console.error(`[SurveyRadar] CMS ${slug} ${r.statusCode}: ${buf.slice(0, 280)}`);
             return reject(new Error(`CMS HTTP ${r.statusCode}: ${buf.slice(0, 280)}`));
           }
           try { resolve(JSON.parse(buf)); }
@@ -1798,26 +1804,89 @@ app.get("/api/cms/survey-radar", async (req, res) => {
       r2.end();
     });
 
-    // Paginate
-    const allRows = [];
-    for (let page = 0; page < MAX_PAGES; page++) {
+    // ─── Paginate inspections ────────────────────────────────────────
+    const allInspections = [];
+    for (let page = 0; page < MAX_INSPECTION_PAGES; page++) {
       const offset = page * PAGE_SIZE;
-      const data = await fetchPage(offset);
+      const data = await fetchCmsPage("svdt-c123", offset);
       const rows = Array.isArray(data) ? data : (data.results || []);
-      console.log(`[SurveyRadar] page ${page + 1}: ${rows.length} rows`);
+      console.log(`[SurveyRadar] inspections page ${page + 1}: ${rows.length} rows`);
       if (rows.length === 0) break;
-      allRows.push(...rows);
+      allInspections.push(...rows);
       if (rows.length < PAGE_SIZE) break;
     }
 
-    // Date-filter in JS — survey_date is YYYY-MM-DD so string compare works
-    const filtered = allRows
+    // Date-filter in JS
+    const filtered = allInspections
       .filter(row => (row.survey_date || "") >= cutoffStr)
       .sort((a, b) => (b.survey_date || "").localeCompare(a.survey_date || ""));
 
-    console.log(`[SurveyRadar] fetched=${allRows.length} after-date=${filtered.length} cutoff=${cutoffStr}`);
+    console.log(`[SurveyRadar] fetched=${allInspections.length} after-date=${filtered.length} cutoff=${cutoffStr}`);
 
-    return res.json({ results: filtered, count: filtered.length });
+    // ─── Build/use provider info cache ───────────────────────────────
+    // Module-level cache (survives across requests within a single Render
+    // instance). Refreshes every hour.
+    const PROVIDER_CACHE_TTL_MS = 60 * 60 * 1000;  // 1 hour
+    if (!global.__providerCache || (Date.now() - global.__providerCacheTime) > PROVIDER_CACHE_TTL_MS) {
+      console.log(`[SurveyRadar] Provider cache miss — fetching provider info...`);
+      const providerMap = {};
+      for (let page = 0; page < 12; page++) {  // up to 18K providers
+        const offset = page * PAGE_SIZE;
+        try {
+          const data = await fetchCmsPage("4pq5-n9py", offset);
+          const rows = Array.isArray(data) ? data : (data.results || []);
+          console.log(`[SurveyRadar] providers page ${page + 1}: ${rows.length} rows`);
+          if (rows.length === 0) break;
+          for (const p of rows) {
+            const ccn = p.cms_certification_number_ccn || p.federal_provider_number;
+            if (ccn) {
+              providerMap[ccn] = {
+                provider_name: p.provider_name || null,
+                city: p.citytown || p.city || null,
+                state: p.state || p.provider_state || null,
+                zip: p.zip_code || null,
+                address: p.provider_address || p.address || null,
+                ownership: p.ownership_type || null,
+                beds: p.number_of_certified_beds || null,
+                overall_rating: p.overall_rating || null,
+                health_inspection_rating: p.health_inspection_rating || null,
+                staffing_rating: p.staffing_rating || null,
+              };
+            }
+          }
+          if (rows.length < PAGE_SIZE) break;
+        } catch (e) {
+          console.error(`[SurveyRadar] provider fetch failed at page ${page + 1}:`, e.message);
+          break;
+        }
+      }
+      global.__providerCache = providerMap;
+      global.__providerCacheTime = Date.now();
+      console.log(`[SurveyRadar] Provider cache built: ${Object.keys(providerMap).length} entries`);
+    } else {
+      console.log(`[SurveyRadar] Provider cache hit: ${Object.keys(global.__providerCache).length} entries`);
+    }
+
+    // ─── Enrich inspections with provider info ───────────────────────
+    const enriched = filtered.map(insp => {
+      const ccn = insp.cms_certification_number_ccn;
+      const p = global.__providerCache[ccn] || {};
+      return {
+        ...insp,
+        provider_name: p.provider_name || null,
+        city: p.city || null,
+        state: p.state || null,
+        zip: p.zip || null,
+        address: p.address || null,
+        ownership: p.ownership || null,
+        beds: p.beds || null,
+        overall_rating: p.overall_rating || null,
+        health_inspection_rating: p.health_inspection_rating || null,
+        staffing_rating: p.staffing_rating || null,
+      };
+    });
+
+    return res.json({ results: enriched, count: enriched.length });
 
   } catch (e) {
     console.error("[SurveyRadar] Error:", e.message);
