@@ -1757,31 +1757,62 @@ app.get("/api/cms/survey-radar", async (req, res) => {
     cutoff.setDate(cutoff.getDate() - parseInt(days || "30", 10));
     const cutoffStr = cutoff.toISOString().split("T")[0];
 
-    // Build SQL query for CMS DKAN SQL endpoint
-    const stateClause = (state && state !== "all")
-      ? ` AND provstate = '${state.replace(/'/g,"''")}' `
-      : "";
-    const sql = `[SELECT * FROM r5ix-sfxw WHERE survey_date >= '${cutoffStr}'${stateClause} LIMIT 2000]`;
-    const url = `https://data.cms.gov/provider-data/api/1/sql?query=${encodeURIComponent(sql)}`;
-    console.log("[SurveyRadar] SQL URL:", url.slice(0, 200));
+    // Use the SAME datastore/query endpoint pattern that powers the working
+    // /api/cms/facility/:ccn lookup. The previous code used the SQL endpoint
+    // which had wrong path, wrong dataset ID format, and unverified column
+    // names — all of which combined to produce 500 errors.
+    //
+    // Dataset r5ix-sfxw = Health Deficiencies. We filter server-side by
+    // state via the conditions[] params, then date-filter in JS after fetch
+    // (the datastore filter doesn't support >= on dates reliably).
+    const conditions = [];
+    if (state && state !== "all") {
+      conditions.push({ resource: "t", property: "state", value: state, operator: "=" });
+    }
+    const queryBody = {
+      conditions: conditions.length ? conditions : undefined,
+      limit: 5000,
+    };
 
-    // Use https module directly — most reliable in Node/Render
+    const url = `https://data.cms.gov/provider-data/api/1/datastore/query/r5ix-sfxw/0`;
+    console.log("[SurveyRadar] POST", url, JSON.stringify(queryBody));
+
     const results = await new Promise((resolve, reject) => {
-      https.get(url, { headers: { "Accept": "application/json", "User-Agent": "Node/SurvAIHealth" } }, (r) => {
-        let body = "";
-        r.on("data", chunk => body += chunk);
+      const body = JSON.stringify(queryBody);
+      const req2 = https.request(url, {
+        method: "POST",
+        headers: {
+          "Accept": "application/json",
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(body),
+          "User-Agent": "Node/SurvAIHealth",
+        },
+      }, (r) => {
+        let buf = "";
+        r.on("data", chunk => buf += chunk);
         r.on("end", () => {
-          console.log("[SurveyRadar] status:", r.statusCode, "len:", body.length, "preview:", body.slice(0,150));
-          if (r.statusCode !== 200) return reject(new Error(`CMS HTTP ${r.statusCode}: ${body.slice(0,200)}`));
-          try { resolve(JSON.parse(body)); }
-          catch(e) { reject(new Error("JSON parse error: " + body.slice(0,200))); }
+          console.log("[SurveyRadar] status:", r.statusCode, "len:", buf.length, "preview:", buf.slice(0, 200));
+          if (r.statusCode !== 200) return reject(new Error(`CMS HTTP ${r.statusCode}: ${buf.slice(0, 300)}`));
+          try { resolve(JSON.parse(buf)); }
+          catch(e) { reject(new Error("JSON parse error: " + buf.slice(0, 300))); }
         });
-        r.on("error", reject);
-      }).on("error", reject);
+      });
+      req2.on("error", reject);
+      req2.write(body);
+      req2.end();
     });
 
-    const arr = Array.isArray(results) ? results : (results.results || []);
-    console.log(`[SurveyRadar] ${arr.length} records for ${state || "all"}`);
+    let arr = Array.isArray(results) ? results : (results.results || []);
+    console.log(`[SurveyRadar] CMS returned ${arr.length} rows for state=${state || "all"}`);
+
+    // Date-filter in JS — the survey_date field uses YYYY-MM-DD strings so
+    // string comparison works correctly here.
+    arr = arr.filter(row => {
+      const sd = row.survey_date || row.surveydate || "";
+      return sd >= cutoffStr;
+    });
+    console.log(`[SurveyRadar] After date filter (>= ${cutoffStr}): ${arr.length} rows`);
+
     return res.json({ results: arr, count: arr.length });
 
   } catch (e) {
