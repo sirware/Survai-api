@@ -1745,4 +1745,42 @@ app.get("/api/cms/state-staffing-medians/:state", cms.handleStateStaffingMedians
 // State Enforcement Outlook — top-cited tags, density, surge in your state
 app.get("/api/cms/state-enforcement/:state", cms.handleStateEnforcement(supabase));
 
+
+// ── Survey Radar — CMS Health Deficiencies proxy ─────────────────────────────
+// Proxies the CMS Socrata API to avoid browser CORS/403 restrictions.
+// Frontend calls this; server fetches from CMS and returns results.
+app.get("/api/cms/survey-radar", async (req, res) => {
+  const { state, days } = req.query;
+  if (!state) return res.status(400).json({ error: "state is required" });
+
+  try {
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - parseInt(days || "30", 10));
+    const cutoffStr = cutoff.toISOString().split("T")[0];
+
+    const params = new URLSearchParams({
+      "$where": `state='${state}' AND survey_date>='${cutoffStr}'`,
+      "$limit": "1000",
+      "$order": "survey_date DESC",
+    });
+
+    const cmsRes = await fetch(
+      `https://data.cms.gov/resource/r5ix-sfxw.json?${params}`,
+      { headers: { "Accept": "application/json", "X-App-Token": "" } }
+    );
+
+    if (!cmsRes.ok) {
+      const text = await cmsRes.text();
+      console.error("CMS API error:", cmsRes.status, text.slice(0, 200));
+      return res.status(502).json({ error: "CMS API error", status: cmsRes.status });
+    }
+
+    const data = await cmsRes.json();
+    return res.json({ results: data, count: data.length });
+  } catch (e) {
+    console.error("Survey Radar error:", e.message);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
 app.listen(PORT, () => console.log(`SurvAI API running on port ${PORT}`));
