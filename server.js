@@ -1749,7 +1749,7 @@ app.get("/api/cms/state-enforcement/:state", cms.handleStateEnforcement(supabase
 // ── Survey Radar — CMS Health Deficiencies proxy ─────────────────────────────
 // Uses CMS DKAN SQL endpoint — simple GET, no auth needed
 app.get("/api/cms/survey-radar", async (req, res) => {
-  const { state, days } = req.query;
+  const { state, days, debug } = req.query;
   const https = require("https");
 
   try {
@@ -1757,38 +1757,31 @@ app.get("/api/cms/survey-radar", async (req, res) => {
     cutoff.setDate(cutoff.getDate() - parseInt(days || "30", 10));
     const cutoffStr = cutoff.toISOString().split("T")[0];
 
-    // ─── Why Inspection Dates (svdt-c123), not Health Deficiencies ──────
-    // The original code used r5ix-sfxw (Health Deficiencies) which is the
-    // wrong dataset for "who got surveyed recently." Two reasons:
+    // ─── Why this approach ─────────────────────────────────────────────
+    // The Inspection Dates dataset (svdt-c123) is the right table for
+    // "facilities recently surveyed" — it includes inspections regardless
+    // of whether citations were issued, with much less publication lag
+    // than r5ix-sfxw (Health Deficiencies).
     //
-    //   1. r5ix-sfxw only contains rows when a survey produced citations.
-    //      Facilities surveyed with zero findings are invisible.
-    //   2. CMS publishes citations 2-3 months after the survey date.
-    //      Recent surveys don't have citations posted yet.
+    // Column names in this dataset don't match the citation datasets —
+    // CMS standardized to slightly different naming (e.g., the state
+    // column is named differently). Rather than guess, we fetch without
+    // server-side filters, inspect the keys of returned rows, and filter
+    // in JS using whatever column name is present.
     //
-    // svdt-c123 (Inspection Dates) is the right feed:
-    //   - One row per inspection (standard, complaint, infection control)
-    //   - Dates included whether or not citations were issued
-    //   - Lower publication lag — appears days/weeks after, not months
-    //
-    // Endpoint constraints (same as before):
-    //   - Path: /datastore/query (slug stable across CMS refreshes)
+    // /datastore/query endpoint constraints:
     //   - LIMIT max 1500
-    //   - One filter per conditions[] entry, no compound clauses
-    //   - Date filtering done in JS post-fetch
+    //   - One filter per conditions[] (no AND)
+    //   - Slug works (UUID rotates → bad)
     const PAGE_SIZE = 1500;
-    const MAX_PAGES = 4;
+    const MAX_PAGES = 6; // up to 9000 rows nationally — enough for any state
     const wantState = (state && state !== "all") ? state.toUpperCase() : null;
 
     const fetchPage = (offset) => new Promise((resolve, reject) => {
-      const queryBody = {
-        limit: PAGE_SIZE,
-        offset,
-        conditions: wantState ? [{ property: "state", value: wantState, operator: "=" }] : [],
-      };
+      const queryBody = { limit: PAGE_SIZE, offset, conditions: [] };
       const body = JSON.stringify(queryBody);
       const url = "https://data.cms.gov/provider-data/api/1/datastore/query/svdt-c123/0";
-      console.log(`[SurveyRadar] POST offset=${offset} state=${wantState || "all"}`);
+      console.log(`[SurveyRadar] POST offset=${offset}`);
 
       const r2 = https.request(url, {
         method: "POST",
@@ -1816,25 +1809,69 @@ app.get("/api/cms/survey-radar", async (req, res) => {
       r2.end();
     });
 
-    // Paginate
-    const allRows = [];
-    for (let page = 0; page < MAX_PAGES; page++) {
-      const offset = page * PAGE_SIZE;
-      const data = await fetchPage(offset);
-      const rows = Array.isArray(data) ? data : (data.results || []);
-      console.log(`[SurveyRadar] page ${page + 1}: ${rows.length} rows`);
-      if (rows.length === 0) break;
-      allRows.push(...rows);
-      if (rows.length < PAGE_SIZE) break;
+    // Fetch first page to discover the column shape
+    const firstPage = await fetchPage(0);
+    const firstRows = Array.isArray(firstPage) ? firstPage : (firstPage.results || []);
+
+    if (firstRows.length === 0) {
+      console.log(`[SurveyRadar] dataset returned zero rows`);
+      return res.json({ results: [], count: 0, debug_keys: [] });
     }
 
-    // Date-filter in JS — Inspection Dates uses survey_date column
+    // Log the actual column names so we can see what's there
+    const sampleKeys = Object.keys(firstRows[0]);
+    console.log(`[SurveyRadar] dataset columns:`, sampleKeys.join(", "));
+
+    // Debug mode — return the sample row so we can inspect the schema
+    if (debug === "1") {
+      return res.json({
+        sample_row: firstRows[0],
+        column_names: sampleKeys,
+        total_in_page1: firstRows.length,
+      });
+    }
+
+    // Detect column names heuristically — match on common variations
+    const stateKey = sampleKeys.find(k => /^state$|^prov.*state$|state_code|provider_state/i.test(k));
+    const dateKey  = sampleKeys.find(k => /survey_date|inspection_date|survey_dt|inspect_date/i.test(k));
+    const ccnKey   = sampleKeys.find(k => /ccn|certification_number|provider_id|provnum/i.test(k));
+    const nameKey  = sampleKeys.find(k => /provider_name|facility_name|prov_name/i.test(k));
+    console.log(`[SurveyRadar] detected: state=${stateKey} date=${dateKey} ccn=${ccnKey} name=${nameKey}`);
+
+    if (!stateKey || !dateKey) {
+      // Couldn't detect critical columns — return debug info to help diagnose
+      return res.status(500).json({
+        error: "Could not detect state/date columns",
+        column_names: sampleKeys,
+        sample_row: firstRows[0],
+      });
+    }
+
+    // Now collect all pages
+    const allRows = [...firstRows];
+    if (firstRows.length === PAGE_SIZE) {
+      for (let page = 1; page < MAX_PAGES; page++) {
+        const offset = page * PAGE_SIZE;
+        const data = await fetchPage(offset);
+        const rows = Array.isArray(data) ? data : (data.results || []);
+        console.log(`[SurveyRadar] page ${page + 1}: ${rows.length} rows`);
+        if (rows.length === 0) break;
+        allRows.push(...rows);
+        if (rows.length < PAGE_SIZE) break;
+      }
+    }
+
+    // JS-side filter: state + date
     const filtered = allRows.filter(row => {
-      const sd = row.survey_date || row.surveydate || row.inspection_date || "";
+      if (wantState) {
+        const rowState = String(row[stateKey] || "").toUpperCase();
+        if (rowState !== wantState) return false;
+      }
+      const sd = row[dateKey] || "";
       return sd >= cutoffStr;
     });
 
-    console.log(`[SurveyRadar] state=${wantState || "all"} fetched=${allRows.length} after-date=${filtered.length} cutoff=${cutoffStr}`);
+    console.log(`[SurveyRadar] state=${wantState || "all"} fetched=${allRows.length} after-filter=${filtered.length} cutoff=${cutoffStr}`);
 
     return res.json({ results: filtered, count: filtered.length });
 
