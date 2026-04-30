@@ -1749,32 +1749,28 @@ app.get("/api/cms/state-enforcement/:state", cms.handleStateEnforcement(supabase
 // ── Survey Radar — CMS Health Deficiencies proxy ─────────────────────────────
 // Uses CMS DKAN SQL endpoint — simple GET, no auth needed
 app.get("/api/cms/survey-radar", async (req, res) => {
-  const { state, days, debug } = req.query;
+  const { days } = req.query;
   const https = require("https");
 
   try {
     const cutoff = new Date();
     cutoff.setDate(cutoff.getDate() - parseInt(days || "30", 10));
     const cutoffStr = cutoff.toISOString().split("T")[0];
-    const wantState = (state && state !== "all") ? state.toUpperCase() : null;
 
-    // ─── Architecture ──────────────────────────────────────────────────
-    // The Inspection Dates dataset (svdt-c123) only has 5 columns:
+    // ─── Simple version ──────────────────────────────────────────────
+    // Pulls recent inspections from svdt-c123 (Inspection Dates) and
+    // returns whatever columns CMS gives us. No state filter, no join
+    // with provider info — Inspection Dates only has these 5 columns:
     //   cms_certification_number_ccn, survey_date, type_of_survey,
     //   survey_cycle, processing_date
-    // It does NOT include state — so we have to join with Provider
-    // Information (4pq5-n9py) to filter/enrich by state.
-    //
-    // Approach: pull recent inspections (no state filter), pull state's
-    // facilities in parallel, join by CCN, return enriched rows. Fast
-    // enough — both queries run concurrently and complete in ~5 sec.
+    // The frontend can group/sort/display however it wants.
     const PAGE_SIZE = 1500;
-    const MAX_INSPECTION_PAGES = 8; // 12000 rows max — covers ~6 months of data
-    const MAX_PROVIDER_PAGES = 2;   // ~3000 facilities — covers any single state
+    const MAX_PAGES = 8; // 12000 rows max — covers ~6 months nationally
 
-    const postQuery = (slug, queryBody) => new Promise((resolve, reject) => {
+    const fetchPage = (offset) => new Promise((resolve, reject) => {
+      const queryBody = { limit: PAGE_SIZE, offset, conditions: [] };
       const body = JSON.stringify(queryBody);
-      const url = `https://data.cms.gov/provider-data/api/1/datastore/query/${slug}/0`;
+      const url = "https://data.cms.gov/provider-data/api/1/datastore/query/svdt-c123/0";
 
       const r2 = https.request(url, {
         method: "POST",
@@ -1789,6 +1785,7 @@ app.get("/api/cms/survey-radar", async (req, res) => {
         r.on("data", chunk => buf += chunk);
         r.on("end", () => {
           if (r.statusCode !== 200) {
+            console.error(`[SurveyRadar] CMS ${r.statusCode}: ${buf.slice(0, 280)}`);
             return reject(new Error(`CMS HTTP ${r.statusCode}: ${buf.slice(0, 280)}`));
           }
           try { resolve(JSON.parse(buf)); }
@@ -1801,76 +1798,24 @@ app.get("/api/cms/survey-radar", async (req, res) => {
       r2.end();
     });
 
-    const fetchAllPages = async (slug, conditions, maxPages, label) => {
-      const all = [];
-      for (let page = 0; page < maxPages; page++) {
-        const offset = page * PAGE_SIZE;
-        const data = await postQuery(slug, { limit: PAGE_SIZE, offset, conditions: conditions || [] });
-        const rows = Array.isArray(data) ? data : (data.results || []);
-        console.log(`[SurveyRadar] ${label} page ${page + 1}: ${rows.length} rows`);
-        if (rows.length === 0) break;
-        all.push(...rows);
-        if (rows.length < PAGE_SIZE) break;
-      }
-      return all;
-    };
-
-    // Run both queries in parallel for speed
-    console.log(`[SurveyRadar] Fetching inspections + ${wantState || "all-state"} providers in parallel`);
-    const [inspections, providers] = await Promise.all([
-      fetchAllPages("svdt-c123", [], MAX_INSPECTION_PAGES, "inspections"),
-      wantState
-        ? fetchAllPages("4pq5-n9py", [{ property: "provider_state", value: wantState, operator: "=" }], MAX_PROVIDER_PAGES, "providers")
-        : Promise.resolve([]),
-    ]);
-
-    // Build CCN → provider map for fast lookup
-    const providerByCcn = {};
-    for (const p of providers) {
-      const ccn = p.cms_certification_number_ccn || p.federal_provider_number;
-      if (ccn) providerByCcn[ccn] = p;
-    }
-    console.log(`[SurveyRadar] indexed ${Object.keys(providerByCcn).length} ${wantState || "all"} providers`);
-
-    // Filter inspections by date + (optionally) state via provider join
-    const filtered = [];
-    for (const insp of inspections) {
-      const sd = insp.survey_date || "";
-      if (sd < cutoffStr) continue;
-
-      const ccn = insp.cms_certification_number_ccn;
-      const provider = providerByCcn[ccn];
-
-      if (wantState && !provider) continue; // not in target state
-
-      filtered.push({
-        ...insp,
-        // Enrich with provider details when available
-        provider_name: provider?.provider_name || null,
-        city: provider?.citytown || provider?.city || null,
-        state: provider?.provider_state || provider?.state || null,
-        zip: provider?.zip_code || null,
-        ownership: provider?.ownership_type || null,
-        beds: provider?.number_of_certified_beds || null,
-        overall_rating: provider?.overall_rating || null,
-        health_inspection_rating: provider?.health_inspection_rating || null,
-        staffing_rating: provider?.staffing_rating || null,
-      });
+    // Paginate
+    const allRows = [];
+    for (let page = 0; page < MAX_PAGES; page++) {
+      const offset = page * PAGE_SIZE;
+      const data = await fetchPage(offset);
+      const rows = Array.isArray(data) ? data : (data.results || []);
+      console.log(`[SurveyRadar] page ${page + 1}: ${rows.length} rows`);
+      if (rows.length === 0) break;
+      allRows.push(...rows);
+      if (rows.length < PAGE_SIZE) break;
     }
 
-    // Sort newest first
-    filtered.sort((a, b) => (b.survey_date || "").localeCompare(a.survey_date || ""));
+    // Date-filter in JS — survey_date is YYYY-MM-DD so string compare works
+    const filtered = allRows
+      .filter(row => (row.survey_date || "") >= cutoffStr)
+      .sort((a, b) => (b.survey_date || "").localeCompare(a.survey_date || ""));
 
-    console.log(`[SurveyRadar] state=${wantState || "all"} inspections=${inspections.length} after-filter=${filtered.length} cutoff=${cutoffStr}`);
-
-    if (debug === "1") {
-      return res.json({
-        sample: filtered[0] || null,
-        count: filtered.length,
-        inspections_total: inspections.length,
-        providers_total: providers.length,
-      });
-    }
+    console.log(`[SurveyRadar] fetched=${allRows.length} after-date=${filtered.length} cutoff=${cutoffStr}`);
 
     return res.json({ results: filtered, count: filtered.length });
 
