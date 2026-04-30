@@ -1747,8 +1747,7 @@ app.get("/api/cms/state-enforcement/:state", cms.handleStateEnforcement(supabase
 
 
 // ── Survey Radar — CMS Health Deficiencies proxy ─────────────────────────────
-// Proxies the CMS Socrata API to avoid browser CORS/403 restrictions.
-// Frontend calls this; server fetches from CMS and returns results.
+// Proxies CMS datastore API (same pattern as CMP Exposure) to avoid CORS.
 app.get("/api/cms/survey-radar", async (req, res) => {
   const { state, days } = req.query;
   if (!state) return res.status(400).json({ error: "state is required" });
@@ -1758,25 +1757,40 @@ app.get("/api/cms/survey-radar", async (req, res) => {
     cutoff.setDate(cutoff.getDate() - parseInt(days || "30", 10));
     const cutoffStr = cutoff.toISOString().split("T")[0];
 
-    const params = new URLSearchParams({
-      "$where": `state='${state}' AND survey_date>='${cutoffStr}'`,
-      "$limit": "1000",
-      "$order": "survey_date DESC",
-    });
+    // Use the DKAN datastore API — same pattern as CMP Exposure (known to work server-side)
+    const body = {
+      conditions: [
+        { property: "state", value: state, operator: "=" },
+        { property: "survey_date", value: cutoffStr, operator: ">=" },
+      ],
+      sort: [{ property: "survey_date", order: "desc" }],
+      limit: 1000,
+      offset: 0,
+    };
 
     const cmsRes = await fetch(
-      `https://data.cms.gov/resource/r5ix-sfxw.json?${params}`,
-      { headers: { "Accept": "application/json", "X-App-Token": "" } }
+      "https://data.cms.gov/provider-data/api/1/datastore/query/r5ix-sfxw/0",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Accept": "application/json",
+          "User-Agent": "SurvAIHealth/1.0 (survaihealth.com)",
+        },
+        body: JSON.stringify(body),
+      }
     );
 
     if (!cmsRes.ok) {
       const text = await cmsRes.text();
-      console.error("CMS API error:", cmsRes.status, text.slice(0, 200));
-      return res.status(502).json({ error: "CMS API error", status: cmsRes.status });
+      console.error("CMS Survey Radar error:", cmsRes.status, text.slice(0, 300));
+      return res.status(502).json({ error: "CMS API error", status: cmsRes.status, detail: text.slice(0, 200) });
     }
 
     const data = await cmsRes.json();
-    return res.json({ results: data, count: data.length });
+    const results = data.results || data || [];
+    console.log(`Survey Radar: ${results.length} deficiencies for ${state}`);
+    return res.json({ results, count: results.length });
   } catch (e) {
     console.error("Survey Radar error:", e.message);
     return res.status(500).json({ error: e.message });
