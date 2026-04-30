@@ -1747,61 +1747,45 @@ app.get("/api/cms/state-enforcement/:state", cms.handleStateEnforcement(supabase
 
 
 // ── Survey Radar — CMS Health Deficiencies proxy ─────────────────────────────
-// Uses same GET param pattern as CMP Exposure tool (proven to work server-side).
-// Field names: provnum, provname, provstate, survey_date, tag_number / deficiency_tag_number,
-//              scope_severity / scope_severity_code, city, address, zip
+// Uses CMS DKAN SQL endpoint — simple GET, no auth needed
 app.get("/api/cms/survey-radar", async (req, res) => {
   const { state, days } = req.query;
+  const https = require("https");
 
   try {
     const cutoff = new Date();
     cutoff.setDate(cutoff.getDate() - parseInt(days || "30", 10));
     const cutoffStr = cutoff.toISOString().split("T")[0];
 
-    // Build GET URL — same approach as CMP deficiency fetch (known to work)
-    let baseUrl = "https://data.cms.gov/provider-data/api/1/datastore/query/r5ix-sfxw/0";
-    let params = `limit=2000&conditions[0][property]=survey_date&conditions[0][value]=${cutoffStr}&conditions[0][operator]=>=`;
+    // Build SQL query for CMS DKAN SQL endpoint
+    const stateClause = (state && state !== "all")
+      ? ` AND provstate = '${state.replace(/'/g,"''")}' `
+      : "";
+    const sql = `[SELECT * FROM r5ix-sfxw WHERE survey_date >= '${cutoffStr}'${stateClause} LIMIT 2000]`;
+    const url = `https://data.cms.gov/provider-data/api/1/sql?query=${encodeURIComponent(sql)}`;
+    console.log("[SurveyRadar] SQL URL:", url.slice(0, 200));
 
-    // Add state filter if not "all"
-    if (state && state !== "all") {
-      // Try provstate first (common field name in this dataset)
-      params += `&conditions[1][property]=provstate&conditions[1][value]=${state}&conditions[1][operator]==`;
-    }
-
-    const url = `${baseUrl}?${params}`;
-    console.log("Survey Radar URL:", url);
-
-    const cmsRes = await fetch(url, {
-      headers: { "Accept": "application/json", "User-Agent": "SurvAIHealth/1.0" },
+    // Use https module directly — most reliable in Node/Render
+    const results = await new Promise((resolve, reject) => {
+      https.get(url, { headers: { "Accept": "application/json", "User-Agent": "Node/SurvAIHealth" } }, (r) => {
+        let body = "";
+        r.on("data", chunk => body += chunk);
+        r.on("end", () => {
+          console.log("[SurveyRadar] status:", r.statusCode, "len:", body.length, "preview:", body.slice(0,150));
+          if (r.statusCode !== 200) return reject(new Error(`CMS HTTP ${r.statusCode}: ${body.slice(0,200)}`));
+          try { resolve(JSON.parse(body)); }
+          catch(e) { reject(new Error("JSON parse error: " + body.slice(0,200))); }
+        });
+        r.on("error", reject);
+      }).on("error", reject);
     });
 
-    if (!cmsRes.ok) {
-      const text = await cmsRes.text();
-      console.error("CMS Survey Radar error:", cmsRes.status, text.slice(0, 300));
+    const arr = Array.isArray(results) ? results : (results.results || []);
+    console.log(`[SurveyRadar] ${arr.length} records for ${state || "all"}`);
+    return res.json({ results: arr, count: arr.length });
 
-      // Fallback: try with "state" instead of "provstate"
-      const url2 = state && state !== "all"
-        ? `${baseUrl}?limit=2000&conditions[0][property]=survey_date&conditions[0][value]=${cutoffStr}&conditions[0][operator]=>=&conditions[1][property]=state&conditions[1][value]=${state}&conditions[1][operator]==`
-        : `${baseUrl}?limit=2000&conditions[0][property]=survey_date&conditions[0][value]=${cutoffStr}&conditions[0][operator]=>=`;
-
-      const cmsRes2 = await fetch(url2, {
-        headers: { "Accept": "application/json", "User-Agent": "SurvAIHealth/1.0" },
-      });
-      if (!cmsRes2.ok) {
-        return res.status(502).json({ error: "CMS API error", status: cmsRes2.status });
-      }
-      const data2 = await cmsRes2.json();
-      const results2 = data2.results || [];
-      console.log(`Survey Radar fallback: ${results2.length} results for ${state}`);
-      return res.json({ results: results2, count: results2.length });
-    }
-
-    const data = await cmsRes.json();
-    const results = data.results || [];
-    console.log(`Survey Radar: ${results.length} results for ${state || "all"}`);
-    return res.json({ results, count: results.length });
   } catch (e) {
-    console.error("Survey Radar error:", e.message);
+    console.error("[SurveyRadar] Error:", e.message);
     return res.status(500).json({ error: e.message });
   }
 });
