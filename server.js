@@ -1747,49 +1747,58 @@ app.get("/api/cms/state-enforcement/:state", cms.handleStateEnforcement(supabase
 
 
 // ── Survey Radar — CMS Health Deficiencies proxy ─────────────────────────────
-// Proxies CMS datastore API (same pattern as CMP Exposure) to avoid CORS.
+// Uses same GET param pattern as CMP Exposure tool (proven to work server-side).
+// Field names: provnum, provname, provstate, survey_date, tag_number / deficiency_tag_number,
+//              scope_severity / scope_severity_code, city, address, zip
 app.get("/api/cms/survey-radar", async (req, res) => {
   const { state, days } = req.query;
-  if (!state) return res.status(400).json({ error: "state is required" });
 
   try {
     const cutoff = new Date();
     cutoff.setDate(cutoff.getDate() - parseInt(days || "30", 10));
     const cutoffStr = cutoff.toISOString().split("T")[0];
 
-    // Use the DKAN datastore API — same pattern as CMP Exposure (known to work server-side)
-    const body = {
-      conditions: [
-        { property: "state", value: state, operator: "=" },
-        { property: "survey_date", value: cutoffStr, operator: ">=" },
-      ],
-      sort: [{ property: "survey_date", order: "desc" }],
-      limit: 1000,
-      offset: 0,
-    };
+    // Build GET URL — same approach as CMP deficiency fetch (known to work)
+    let baseUrl = "https://data.cms.gov/provider-data/api/1/datastore/query/r5ix-sfxw/0";
+    let params = `limit=2000&conditions[0][property]=survey_date&conditions[0][value]=${cutoffStr}&conditions[0][operator]=>=`;
 
-    const cmsRes = await fetch(
-      "https://data.cms.gov/provider-data/api/1/datastore/query/r5ix-sfxw/0",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Accept": "application/json",
-          "User-Agent": "SurvAIHealth/1.0 (survaihealth.com)",
-        },
-        body: JSON.stringify(body),
-      }
-    );
+    // Add state filter if not "all"
+    if (state && state !== "all") {
+      // Try provstate first (common field name in this dataset)
+      params += `&conditions[1][property]=provstate&conditions[1][value]=${state}&conditions[1][operator]==`;
+    }
+
+    const url = `${baseUrl}?${params}`;
+    console.log("Survey Radar URL:", url);
+
+    const cmsRes = await fetch(url, {
+      headers: { "Accept": "application/json", "User-Agent": "SurvAIHealth/1.0" },
+    });
 
     if (!cmsRes.ok) {
       const text = await cmsRes.text();
       console.error("CMS Survey Radar error:", cmsRes.status, text.slice(0, 300));
-      return res.status(502).json({ error: "CMS API error", status: cmsRes.status, detail: text.slice(0, 200) });
+
+      // Fallback: try with "state" instead of "provstate"
+      const url2 = state && state !== "all"
+        ? `${baseUrl}?limit=2000&conditions[0][property]=survey_date&conditions[0][value]=${cutoffStr}&conditions[0][operator]=>=&conditions[1][property]=state&conditions[1][value]=${state}&conditions[1][operator]==`
+        : `${baseUrl}?limit=2000&conditions[0][property]=survey_date&conditions[0][value]=${cutoffStr}&conditions[0][operator]=>=`;
+
+      const cmsRes2 = await fetch(url2, {
+        headers: { "Accept": "application/json", "User-Agent": "SurvAIHealth/1.0" },
+      });
+      if (!cmsRes2.ok) {
+        return res.status(502).json({ error: "CMS API error", status: cmsRes2.status });
+      }
+      const data2 = await cmsRes2.json();
+      const results2 = data2.results || [];
+      console.log(`Survey Radar fallback: ${results2.length} results for ${state}`);
+      return res.json({ results: results2, count: results2.length });
     }
 
     const data = await cmsRes.json();
-    const results = data.results || data || [];
-    console.log(`Survey Radar: ${results.length} deficiencies for ${state}`);
+    const results = data.results || [];
+    console.log(`Survey Radar: ${results.length} results for ${state || "all"}`);
     return res.json({ results, count: results.length });
   } catch (e) {
     console.error("Survey Radar error:", e.message);
